@@ -440,22 +440,22 @@ from typing import Dict, Any
 import uvicorn
 from pathlib import Path
 
-# Import your existing crew
+# Import your existing tools
 import sys
 sys.path.append(str(Path(__file__).parent.parent.parent))
-from crew import SecurityCrew
+from tools.custom_tool import SOCCommunicationTool  # Adjust import path
 from a2a.types.a2a_types import JSONRPCRequest, JSONRPCResponse, TaskSendParams, TaskResult, TaskStatus
 
-class URLAnalyzerA2AServer:
-    def __init__(self, host="localhost", port=8001):
+class SOCCommunicationA2AServer:
+    def __init__(self, host="localhost", port=8002):
         self.host = host
         self.port = port
         self.app = FastAPI()
-        self.security_crew = SecurityCrew()
+        self.soc_tool = SOCCommunicationTool()
         self.setup_routes()
         
         # Load agent card
-        card_path = Path(__file__).parent.parent / "agent_cards" / "url_analyzer_card.json"
+        card_path = Path(__file__).parent.parent / "agent_cards" / "soc_communication_card.json"
         with open(card_path, 'r') as f:
             self.agent_card = json.load(f)
 
@@ -492,27 +492,23 @@ class URLAnalyzerA2AServer:
         try:
             params = TaskSendParams(**rpc_request.params)
             
-            if params.skillId != "analyze_url_threat":
+            if params.skillId != "communicate_with_soc":
                 raise ValueError(f"Unsupported skill: {params.skillId}")
             
-            # Extract URL from inputs
-            url = params.inputs.get("url", "")
-            if not url:
-                raise ValueError("URL is required")
+            # Extract analysis data
+            analysis_data = params.inputs.get("analysis_data", {})
+            if not analysis_
+                raise ValueError("Analysis data is required")
             
-            # Execute CrewAI analysis
-            result = self.security_crew.crew().kickoff(inputs={"url": url})
-            
-            # Extract trust level (implement your own logic)
-            trust_level = self._extract_trust_level(str(result))
+            # Use existing SOC communication tool
+            soc_response = self.soc_tool._run(analysis_data)
             
             task_result = TaskResult(
                 id=params.id,
                 status=TaskStatus(state="COMPLETED"),
                 outputs={
-                    "url": url,
-                    "trust_level": trust_level,
-                    "analysis_result": str(result)
+                    "soc_response": soc_response,
+                    "analysis_data": analysis_data
                 }
             )
             
@@ -529,25 +525,17 @@ class URLAnalyzerA2AServer:
 
     async def handle_task_get(self, rpc_request: JSONRPCRequest) -> JSONRPCResponse:
         """Handle task/get requests - simplified for demo"""
-        # In production, you'd maintain a task store
         return JSONRPCResponse(
             id=rpc_request.id,
             result={"message": "Task retrieval not implemented in this demo"}
         )
-
-    def _extract_trust_level(self, result_text: str) -> int:
-        """Extract trust level from analysis result"""
-        import re
-        match = re.search(r'trust.*?level.*?(\d+)', result_text.lower())
-        if match:
-            return int(match.group(1))
-        return 5  # Default
 
     def run(self):
         """Start the server"""
         uvicorn.run(self.app, host=self.host, port=self.port)
 
 if __name__ == "__main__":
-    server = URLAnalyzerA2AServer()
-    print(f"Starting URL Analyzer A2A Server on http://localhost:8001")
+    server = SOCCommunicationA2AServer()
+    print(f"Starting SOC Communication A2A Server on http://localhost:8002")
     server.run()
+
