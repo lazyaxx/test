@@ -1,13 +1,27 @@
-mkdir -p ~/Saketh/Python312
+# Install libffi locally
 cd ~
-wget https://www.python.org/ftp/python/3.12.10/Python-3.12.10.tgz
-tar -xzf Python-3.12.10.tgz
-cd Python-3.12.10
-./configure --prefix=$HOME/Saketh/Python312 --enable-optimizations
+wget ftp://sourceware.org/pub/libffi/libffi-3.2.1.tar.gz
+tar -xzf libffi-3.2.1.tar.gz
+cd libffi-3.2.1
+./configure --prefix=$HOME/Saketh/libffi
+make && make install
+
+# Set environment variables
+export LD_LIBRARY_PATH=$HOME/Saketh/libffi/lib64:$HOME/Saketh/libffi/lib:$LD_LIBRARY_PATH
+export PKG_CONFIG_PATH=$HOME/Saketh/libffi/lib/pkgconfig:$PKG_CONFIG_PATH
+
+# Rebuild Python with libffi support
+cd ~/Python-3.12.10
+make clean
+./configure --prefix=$HOME/Saketh/Python312 \
+    --enable-optimizations \
+    --with-system-ffi \
+    CPPFLAGS="-I$HOME/Saketh/libffi/include" \
+    LDFLAGS="-L$HOME/Saketh/libffi/lib64 -L$HOME/Saketh/libffi/lib" \
+    PKG_CONFIG_PATH="$HOME/Saketh/libffi/lib/pkgconfig"
 make -j$(nproc)
 make altinstall
-mkdir -p ~/bin
-ln -s ~/Saketh/Python312/bin/python3.12 ~/bin/python3.12
-echo 'export PATH=$HOME/Saketh/Python312/bin:$HOME/bin:$PATH' >> ~/.bashrc
-source ~/.bashrc
-python3.12 --version
+
+# Test the installation
+python3.12 -c "import ctypes; print('ctypes works!')"
+
