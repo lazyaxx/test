@@ -432,110 +432,119 @@ Security: Built-in authentication and secure communication protocols
 
 This A2A implementation transforms your monolithic CrewAI flow into a distributed system where agents communicate through standardized protocols, making your system more modular, scalable, and interoperable with other AI agent frameworks.
 
+import asyncio
+import aiohttp
 import json
-import os
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
-from typing import Dict, Any
-import uvicorn
-from pathlib import Path
+from typing import List, Dict, Any
+from uuid import uuid4
+from a2a.types.a2a_types import JSONRPCRequest, TaskSendParams
 
-# Import your existing tools
-import sys
-sys.path.append(str(Path(__file__).parent.parent.parent))
-from tools.custom_tool import SOCCommunicationTool  # Adjust import path
-from a2a.types.a2a_types import JSONRPCRequest, JSONRPCResponse, TaskSendParams, TaskResult, TaskStatus
+class SecurityA2AOrchestrator:
+    def __init__(self):
+        self.url_analyzer_url = "http://localhost:8001"
+        self.soc_communication_url = "http://localhost:8002"
 
-class SOCCommunicationA2AServer:
-    def __init__(self, host="localhost", port=8002):
-        self.host = host
-        self.port = port
-        self.app = FastAPI()
-        self.soc_tool = SOCCommunicationTool()
-        self.setup_routes()
-        
-        # Load agent card
-        card_path = Path(__file__).parent.parent / "agent_cards" / "soc_communication_card.json"
-        with open(card_path, 'r') as f:
-            self.agent_card = json.load(f)
-
-    def setup_routes(self):
-        """Setup FastAPI routes for A2A protocol"""
-        
-        @self.app.get("/.well-known/agent.json")
-        async def get_agent_card():
-            """Serve agent card for discovery"""
-            return self.agent_card
-
-        @self.app.post("/")
-        async def handle_jsonrpc_request(request: Request):
-            """Handle A2A JSON-RPC requests"""
-            try:
-                body = await request.json()
-                rpc_request = JSONRPCRequest(**body)
-                
-                if rpc_request.method == "tasks/send":
-                    return await self.handle_task_send(rpc_request)
-                elif rpc_request.method == "tasks/get":
-                    return await self.handle_task_get(rpc_request)
-                else:
-                    raise HTTPException(status_code=400, detail="Unsupported method")
-                    
-            except Exception as e:
-                return JSONRPCResponse(
-                    id=rpc_request.id if 'rpc_request' in locals() else "unknown",
-                    error={"code": -32603, "message": str(e)}
-                )
-
-    async def handle_task_send(self, rpc_request: JSONRPCRequest) -> JSONRPCResponse:
-        """Handle task/send requests"""
-        try:
-            params = TaskSendParams(**rpc_request.params)
-            
-            if params.skillId != "communicate_with_soc":
-                raise ValueError(f"Unsupported skill: {params.skillId}")
-            
-            # Extract analysis data
-            analysis_data = params.inputs.get("analysis_data", {})
-            if not analysis_
-                raise ValueError("Analysis data is required")
-            
-            # Use existing SOC communication tool
-            soc_response = self.soc_tool._run(analysis_data)
-            
-            task_result = TaskResult(
-                id=params.id,
-                status=TaskStatus(state="COMPLETED"),
-                outputs={
-                    "soc_response": soc_response,
-                    "analysis_data": analysis_data
-                }
-            )
-            
-            return JSONRPCResponse(
-                id=rpc_request.id,
-                result=task_result.dict()
-            )
-            
-        except Exception as e:
-            return JSONRPCResponse(
-                id=rpc_request.id,
-                error={"code": -32603, "message": str(e)}
-            )
-
-    async def handle_task_get(self, rpc_request: JSONRPCRequest) -> JSONRPCResponse:
-        """Handle task/get requests - simplified for demo"""
-        return JSONRPCResponse(
-            id=rpc_request.id,
-            result={"message": "Task retrieval not implemented in this demo"}
+    async def send_a2a_request(self, url: str, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Send A2A JSON-RPC request"""
+        rpc_request = JSONRPCRequest(
+            method=method,
+            params=params
         )
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url,
+                json=rpc_request.dict(),
+                headers={"Content-Type": "application/json"}
+            ) as response:
+                return await response.json()
 
-    def run(self):
-        """Start the server"""
-        uvicorn.run(self.app, host=self.host, port=self.port)
+    async def analyze_url(self, url: str) -> Dict[str, Any]:
+        """Analyze URL using A2A protocol"""
+        params = TaskSendParams(
+            skillId="analyze_url_threat",
+            inputs={"url": url}
+        ).dict()
+        
+        response = await self.send_a2a_request(
+            self.url_analyzer_url,
+            "tasks/send",
+            params
+        )
+        
+        if "error" in response:
+            raise Exception(f"URL analysis failed: {response['error']}")
+        
+        return response["result"]["outputs"]
+
+    async def communicate_with_soc(self, analysis_ Dict[str, Any]) -> Dict[str, Any]:
+        """Communicate with SOC using A2A protocol"""
+        params = TaskSendParams(
+            skillId="communicate_with_soc",
+            inputs={"analysis_data": analysis_data}
+        ).dict()
+        
+        response = await self.send_a2a_request(
+            self.soc_communication_url,
+            "tasks/send",
+            params
+        )
+        
+        if "error" in response:
+            raise Exception(f"SOC communication failed: {response['error']}")
+        
+        return response["result"]["outputs"]
+
+    async def process_security_workflow(self, urls: List[str]):
+        """Process security workflow using A2A protocol"""
+        print("🚀 Starting A2A Security Workflow")
+        print("=" * 50)
+        
+        results = []
+        
+        for url in urls:
+            try:
+                print(f"\n🔍 Processing: {url}")
+                
+                # Step 1: Analyze URL
+                analysis_result = await self.analyze_url(url)
+                print(f"   ✅ Analysis completed - Trust Level: {analysis_result.get('trust_level', 'Unknown')}")
+                
+                # Step 2: Communicate with SOC
+                soc_result = await self.communicate_with_soc(analysis_result)
+                print(f"   📞 SOC Response: {soc_result.get('soc_response', 'No response')}")
+                
+                results.append({
+                    "url": url,
+                    "analysis": analysis_result,
+                    "soc_response": soc_result,
+                    "status": "completed"
+                })
+                
+            except Exception as e:
+                print(f"   ❌ Error processing {url}: {str(e)}")
+                results.append({
+                    "url": url,
+                    "error": str(e),
+                    "status": "failed"
+                })
+        
+        print(f"\n📊 Processed {len(results)} URLs")
+        return results
+
+async def main():
+    orchestrator = SecurityA2AOrchestrator()
+    
+    demo_urls = [
+        "https://example.com",
+        "https://malware.com/download.exe",
+        "https://phishing-site.net/fake-login"
+    ]
+    
+    results = await orchestrator.process_security_workflow(demo_urls)
+    print(f"\nFinal Results: {json.dumps(results, indent=2)}")
 
 if __name__ == "__main__":
-    server = SOCCommunicationA2AServer()
-    print(f"Starting SOC Communication A2A Server on http://localhost:8002")
-    server.run()
+    asyncio.run(main())
+
 
