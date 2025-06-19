@@ -1,64 +1,52 @@
-from typing import List, Dict, Any, Optional, Literal
-from pydantic import BaseModel, Field
-from uuid import uuid4
-import json
+{
+  "name": "url_analyzer_agent",
+  "description": "Senior Security Analyst specialized in URL threat detection",
+  "url": "http://localhost:8001/",
+  "version": "1.0.0",
+  "capabilities": {
+    "streaming": false,
+    "pushNotifications": true,
+    "stateTransitionHistory": false
+  },
+  "authentication": {
+    "schemes": ["Bearer"]
+  },
+  "defaultInputModes": ["text", "text/plain"],
+  "defaultOutputModes": ["application/json"],
+  "skills": [
+    {
+      "id": "analyze_url_threat",
+      "name": "URL Threat Analysis",
+      "description": "Analyze URLs for security threats and provide trust level assessment",
+      "tags": ["security", "url-analysis", "threat-detection"],
+      "examples": ["Analyze this URL: https://example.com for security threats"]
+    }
+  ]
+}
 
-class AgentCapabilities(BaseModel):
-    streaming: bool = False
-    pushNotifications: bool = False
-    stateTransitionHistory: bool = False
+{
+  "name": "soc_communication_agent", 
+  "description": "SOC Liaison Officer for security operations coordination",
+  "url": "http://localhost:8002/",
+  "version": "1.0.0",
+  "capabilities": {
+    "streaming": false,
+    "pushNotifications": true,
+    "stateTransitionHistory": false
+  },
+  "authentication": {
+    "schemes": ["Bearer"]
+  },
+  "defaultInputModes": ["application/json"],
+  "defaultOutputModes": ["text", "text/plain"],
+  "skills": [
+    {
+      "id": "communicate_with_soc",
+      "name": "SOC Communication",
+      "description": "Send security analysis results to SOC admin and get severity assessment",
+      "tags": ["soc", "communication", "security-assessment"],
+      "examples": ["Send analysis data to SOC admin for severity assessment"]
+    }
+  ]
+}
 
-class AgentAuthentication(BaseModel):
-    schemes: List[str]
-    credentials: Optional[str] = None
-
-class AgentSkill(BaseModel):
-    id: str
-    name: str
-    description: Optional[str] = None
-    tags: Optional[List[str]] = None
-    examples: Optional[List[str]] = None
-    inputModes: Optional[List[str]] = None
-    outputModes: Optional[List[str]] = None
-
-class AgentCard(BaseModel):
-    name: str
-    description: Optional[str] = None
-    url: str
-    version: str
-    capabilities: AgentCapabilities
-    authentication: Optional[AgentAuthentication] = None
-    defaultInputModes: List[str] = ["text", "text/plain"]
-    defaultOutputModes: List[str] = ["text", "text/plain"]
-    skills: List[AgentSkill]
-
-# A2A Protocol Types
-class TaskSendParams(BaseModel):
-    id: str = Field(default_factory=lambda: uuid4().hex)
-    sessionId: str = Field(default_factory=lambda: uuid4().hex)
-    skillId: str
-    inputs: Dict[str, Any]
-    historyLength: Optional[int] = 10
-    pushNotification: Optional[Dict[str, Any]] = None
-
-class TaskStatus(BaseModel):
-    state: Literal["WORKING", "COMPLETED", "INPUT_REQUIRED", "FAILED"]
-    message: Optional[str] = None
-
-class TaskResult(BaseModel):
-    id: str
-    status: TaskStatus
-    outputs: Optional[Dict[str, Any]] = None
-    error: Optional[str] = None
-
-class JSONRPCRequest(BaseModel):
-    jsonrpc: Literal["2.0"] = "2.0"
-    id: str = Field(default_factory=lambda: uuid4().hex)
-    method: str
-    params: Dict[str, Any]
-
-class JSONRPCResponse(BaseModel):
-    jsonrpc: Literal["2.0"] = "2.0"
-    id: str
-    result: Optional[Dict[str, Any]] = None
-    error: Optional[Dict[str, Any]] = None
