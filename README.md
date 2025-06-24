@@ -598,3 +598,178 @@ if __name__ == "__main__":
     print("\nFinal Results:")
     print(results)
     sys.exit(0)
+
+
+
+
+
+from crewai import Agent, Task, Crew
+from crewai.llm import BaseLLM
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
+from typing import Optional, Union, List, Dict, Any
+import os
+
+class DeepSeekLocalLLM(BaseLLM):
+    """Custom LLM implementation for local DeepSeek model"""
+    
+    def __init__(
+        self, 
+        model_path: str = "./deepseek-r1-distill", 
+        temperature: Optional[float] = 0.7,
+        max_length: int = 2048
+    ):
+        # Required: Call parent constructor with model and temperature
+        super().__init__(model=model_path, temperature=temperature)
+        
+        self.model_path = model_path
+        self.max_length = max_length
+        
+        # Load tokenizer and model
+        print(f"Loading model from {model_path}...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            device_map="auto",  # Automatically distribute across available devices
+            torch_dtype=torch.float16,  # Use half precision to save memory
+            trust_remote_code=True
+        )
+        print("Model loaded successfully!")
+    
+    def call(self, messages: Union[str, List[Dict[str, str]]], **kwargs) -> str:
+        """
+        The core method that handles text generation
+        """
+        try:
+            # Handle different message formats
+            if isinstance(messages, str):
+                prompt = messages
+            elif isinstance(messages, list):
+                # Convert conversation format to single prompt
+                prompt = ""
+                for msg in messages:
+                    if isinstance(msg, dict):
+                        role = msg.get('role', 'user')
+                        content = msg.get('content', '')
+                        prompt += f"{role}: {content}\n"
+                    else:
+                        prompt += str(msg) + "\n"
+            else:
+                prompt = str(messages)
+            
+            # Tokenize input
+            inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+            
+            # Generate response
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_length=self.max_length,
+                    do_sample=True,
+                    temperature=self.temperature or 0.7,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    **kwargs
+                )
+            
+            # Decode response
+            generated_text = self.tokenizer.decode(
+                outputs[0], 
+                skip_special_tokens=True
+            )
+            
+            # Remove the original prompt from the response
+            if generated_text.startswith(prompt):
+                response = generated_text[len(prompt):].strip()
+            else:
+                response = generated_text.strip()
+            
+            return response
+            
+        except Exception as e:
+            return f"Error generating response: {str(e)}"
+    
+    def supports_function_calling(self) -> bool:
+        """Return False as most local models don't support function calling"""
+        return False
+    
+    def supports_stop_words(self) -> bool:
+        """Return True if your LLM supports stop sequences"""
+        return True
+    
+    def get_context_window_size(self) -> int:
+        """Return the context window size"""
+        return 4096
+
+# Initialize the custom LLM
+print("Initializing DeepSeek Local LLM...")
+deepseek_llm = DeepSeekLocalLLM(
+    model_path="./deepseek-r1-distill",  # Adjust path as needed
+    temperature=0.7,
+    max_length=1024
+)
+
+# Create agents using the custom LLM
+researcher = Agent(
+    role='Research Analyst',
+    goal='Gather and analyze information on given topics',
+    backstory="""You are an experienced research analyst with a keen eye for detail. 
+    You excel at finding relevant information and presenting it in a clear, organized manner.""",
+    llm=deepseek_llm,
+    verbose=True
+)
+
+writer = Agent(
+    role='Content Writer',
+    goal='Create engaging and informative content based on research',
+    backstory="""You are a skilled content writer who specializes in transforming 
+    research data into compelling, easy-to-read articles and reports.""",
+    llm=deepseek_llm,
+    verbose=True
+)
+
+reviewer = Agent(
+    role='Quality Reviewer',
+    goal='Review and improve content quality',
+    backstory="""You are a meticulous reviewer with years of experience in 
+    editing and quality assurance. You ensure all content meets high standards.""",
+    llm=deepseek_llm,
+    verbose=True
+)
+
+# Define tasks
+research_task = Task(
+    description="""Research the latest trends in artificial intelligence for 2025. 
+    Focus on emerging technologies, market developments, and potential impacts on various industries.""",
+    expected_output="A comprehensive research report with key findings and insights",
+    agent=researcher
+)
+
+writing_task = Task(
+    description="""Based on the research findings, write an engaging article about 
+    AI trends in 2025. Make it accessible to a general business audience.""",
+    expected_output="A well-structured article of 800-1000 words",
+    agent=writer
+)
+
+review_task = Task(
+    description="""Review the written article for clarity, accuracy, and engagement. 
+    Provide suggestions for improvement and create a final polished version.""",
+    expected_output="A reviewed and improved final article with revision notes",
+    agent=reviewer
+)
+
+# Create and run the crew
+crew = Crew(
+    agents=[researcher, writer, reviewer],
+    tasks=[research_task, writing_task, review_task],
+    verbose=2
+)
+
+if __name__ == "__main__":
+    print("Starting CrewAI with local DeepSeek model...")
+    result = crew.kickoff()
+    print("\n" + "="*50)
+    print("FINAL RESULT:")
+    print("="*50)
+    print(result)
+
