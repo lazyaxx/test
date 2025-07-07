@@ -1,44 +1,216 @@
-dependencies {
-    implementation("com.google.ai.client.generativeai:generativeai:0.9.0")
-    implementation("androidx.lifecycle:lifecycle-viewmodel-ktx:2.7.0")
-    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.7.0")
+package com.example.testmcpapp
+
+import android.app.Service
+import android.content.Intent
+import android.os.Binder
+import android.os.IBinder
+import com.google.ai.client.generativeai.GenerativeModel
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+
+class GeminiService : Service() {
     
-    // Your existing dependencies will remain here
-    implementation("androidx.core:core-ktx:1.12.0")
-    implementation("androidx.appcompat:appcompat:1.6.1")
-    implementation("com.google.android.material:material:1.11.0")
-    implementation("androidx.constraintlayout:constraintlayout:2.1.4")
-    testImplementation("junit:junit:4.13.2")
-    androidTestImplementation("androidx.test.ext:junit:1.1.5")
-    androidTestImplementation("androidx.test.espresso:espresso-core:3.5.1")
-}
-
-
-sdk.dir=YOUR_SDK_PATH
-apiKey=YOUR_GEMINI_API_KEY_HERE
-
-
-android {
-    // ... your existing configuration
+    private val binder = GeminiBinder()
+    private lateinit var generativeModel: GenerativeModel
+    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     
-    buildFeatures {
-        buildConfig = true
+    // Interface for communication with activity
+    interface GeminiCallback {
+        fun onResponse(response: String)
+        fun onError(error: String)
+        fun onStarted()
     }
     
-    defaultConfig {
-        // ... your existing config
+    private var callback: GeminiCallback? = null
+    
+    inner class GeminiBinder : Binder() {
+        fun getService(): GeminiService = this@GeminiService
+    }
+    
+    override fun onCreate() {
+        super.onCreate()
+        // Initialize Gemini model
+        generativeModel = GenerativeModel(
+            modelName = "gemini-pro",
+            apiKey = BuildConfig.apiKey
+        )
+    }
+    
+    override fun onBind(intent: Intent): IBinder {
+        return binder
+    }
+    
+    // Method to set callback for communication
+    fun setCallback(callback: GeminiCallback) {
+        this.callback = callback
+    }
+    
+    // Method to remove callback
+    fun removeCallback() {
+        this.callback = null
+    }
+    
+    // Method to send prompt to Gemini
+    fun sendPrompt(prompt: String) {
+        if (prompt.isBlank()) {
+            callback?.onError("Prompt cannot be empty")
+            return
+        }
         
-        val properties = java.util.Properties()
-        properties.load(project.rootProject.file("local.properties").inputStream())
-        buildConfigField("String", "API_KEY", "\"${properties.getProperty("apiKey")}\"")
+        // Notify that processing started
+        callback?.onStarted()
+        
+        // Make API call in background
+        serviceScope.launch {
+            try {
+                val response = generativeModel.generateContent(prompt)
+                val responseText = response.text ?: "No response received"
+                callback?.onResponse(responseText)
+            } catch (e: Exception) {
+                callback?.onError("Error: ${e.message}")
+            }
+        }
+    }
+    
+    override fun onDestroy() {
+        super.onDestroy()
+        callback = null
     }
 }
+
+
+
+package com.example.testmcpapp
+
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.ServiceConnection
+import android.os.Bundle
+import android.os.IBinder
+import android.widget.Button
+import android.widget.EditText
+import android.widget.TextView
+import android.widget.Toast
+import androidx.appcompat.app.AppCompatActivity
+
+class MainActivity : AppCompatActivity(), GeminiService.GeminiCallback {
+    
+    private lateinit var editTextPrompt: EditText
+    private lateinit var buttonSend: Button
+    private lateinit var textViewResponse: TextView
+    
+    private var geminiService: GeminiService? = null
+    private var isBound = false
+    
+    // Service connection
+    private val serviceConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+            val binder = service as GeminiService.GeminiBinder
+            geminiService = binder.getService()
+            geminiService?.setCallback(this@MainActivity)
+            isBound = true
+            
+            // Enable the button once service is connected
+            buttonSend.isEnabled = true
+            buttonSend.text = "Send to Gemini"
+        }
+        
+        override fun onServiceDisconnected(name: ComponentName?) {
+            geminiService?.removeCallback()
+            geminiService = null
+            isBound = false
+            buttonSend.isEnabled = false
+        }
+    }
+    
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+        
+        // Initialize views
+        editTextPrompt = findViewById(R.id.editTextPrompt)
+        buttonSend = findViewById(R.id.buttonSend)
+        textViewResponse = findViewById(R.id.textViewResponse)
+        
+        // Initially disable button until service connects
+        buttonSend.isEnabled = false
+        buttonSend.text = "Connecting..."
+        
+        // Set button click listener
+        buttonSend.setOnClickListener {
+            sendPromptToGemini()
+        }
+        
+        // Start and bind to service
+        startAndBindService()
+    }
+    
+    private fun startAndBindService() {
+        val intent = Intent(this, GeminiService::class.java)
+        startService(intent) // Start the service
+        bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE) // Bind to service
+    }
+    
+    private fun sendPromptToGemini() {
+        val prompt = editTextPrompt.text.toString().trim()
+        
+        if (prompt.isEmpty()) {
+            Toast.makeText(this, "Please enter a prompt", Toast.LENGTH_SHORT).show()
+            return
+        }
+        
+        if (isBound) {
+            geminiService?.sendPrompt(prompt)
+        } else {
+            Toast.makeText(this, "Service not connected", Toast.LENGTH_SHORT).show()
+        }
+    }
+    
+    // Callback methods from GeminiService
+    override fun onResponse(response: String) {
+        runOnUiThread {
+            textViewResponse.text = response
+            buttonSend.isEnabled = true
+            buttonSend.text = "Send to Gemini"
+        }
+    }
+    
+    override fun onError(error: String) {
+        runOnUiThread {
+            textViewResponse.text = error
+            buttonSend.isEnabled = true
+            buttonSend.text = "Send to Gemini"
+            Toast.makeText(this@MainActivity, error, Toast.LENGTH_LONG).show()
+        }
+    }
+    
+    override fun onStarted() {
+        runOnUiThread {
+            buttonSend.isEnabled = false
+            buttonSend.text = "Sending..."
+            textViewResponse.text = "Processing your request..."
+        }
+    }
+    
+    override fun onDestroy() {
+        super.onDestroy()
+        if (isBound) {
+            geminiService?.removeCallback()
+            unbindService(serviceConnection)
+            isBound = false
+        }
+    }
+}
+
 
 
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
-
+    
     <uses-permission android:name="android.permission.INTERNET" />
 
     <application
@@ -49,160 +221,24 @@ android {
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
-        android:theme="@style/Theme.McpAppTest"
+        android:theme="@style/Theme.AppCompat.Light.DarkActionBar"
         tools:targetApi="31">
+        
         <activity
             android:name=".MainActivity"
-            android:exported="true">
+            android:exported="true"
+            android:theme="@style/Theme.AppCompat.Light.DarkActionBar">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        
+        <!-- Add the Gemini Service -->
+        <service
+            android:name=".GeminiService"
+            android:enabled="true"
+            android:exported="false" />
+        
     </application>
-
 </manifest>
-
-
-<?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
-    android:layout_width="match_parent"
-    android:layout_height="match_parent"
-    android:orientation="vertical"
-    android:padding="16dp">
-
-    <TextView
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="Gemini AI Chat"
-        android:textSize="24sp"
-        android:textStyle="bold"
-        android:gravity="center"
-        android:layout_marginBottom="20dp" />
-
-    <EditText
-        android:id="@+id/editTextPrompt"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:hint="Enter your prompt here..."
-        android:minLines="3"
-        android:gravity="top"
-        android:layout_marginBottom="16dp" />
-
-    <Button
-        android:id="@+id/buttonSend"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="Send to Gemini"
-        android:layout_marginBottom="16dp" />
-
-    <ProgressBar
-        android:id="@+id/progressBar"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_gravity="center"
-        android:visibility="gone" />
-
-    <ScrollView
-        android:layout_width="match_parent"
-        android:layout_height="0dp"
-        android:layout_weight="1">
-
-        <TextView
-            android:id="@+id/textViewResponse"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="Response will appear here..."
-            android:textSize="16sp"
-            android:padding="8dp"
-            android:background="@android:color/white"
-            android:textColor="@android:color/black" />
-
-    </ScrollView>
-
-</LinearLayout>
-
-
-
-package com.example.mcpapptest
-
-import androidx.appcompat.app.AppCompatActivity
-import android.os.Bundle
-import android.view.View
-import android.widget.*
-import com.google.ai.client.generativeai.GenerativeModel
-import kotlinx.coroutines.MainScope
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
-
-class MainActivity : AppCompatActivity() {
-    
-    private lateinit var editTextPrompt: EditText
-    private lateinit var buttonSend: Button
-    private lateinit var textViewResponse: TextView
-    private lateinit var progressBar: ProgressBar
-    private lateinit var generativeModel: GenerativeModel
-    
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
-        
-        // Initialize views
-        editTextPrompt = findViewById(R.id.editTextPrompt)
-        buttonSend = findViewById(R.id.buttonSend)
-        textViewResponse = findViewById(R.id.textViewResponse)
-        progressBar = findViewById(R.id.progressBar)
-        
-        // Initialize Gemini model
-        generativeModel = GenerativeModel(
-            modelName = "gemini-1.5-flash",
-            apiKey = BuildConfig.API_KEY
-        )
-        
-        // Set button click listener
-        buttonSend.setOnClickListener {
-            val prompt = editTextPrompt.text.toString().trim()
-            if (prompt.isNotEmpty()) {
-                sendPromptToGemini(prompt)
-            } else {
-                Toast.makeText(this, "Please enter a prompt", Toast.LENGTH_SHORT).show()
-            }
-        }
-    }
-    
-    private fun sendPromptToGemini(prompt: String) {
-        // Show loading state
-        progressBar.visibility = View.VISIBLE
-        buttonSend.isEnabled = false
-        textViewResponse.text = "Generating response..."
-        
-        // Launch coroutine for API call
-        MainScope().launch {
-            try {
-                // Make API call on background thread
-                val response = withContext(Dispatchers.IO) {
-                    generativeModel.generateContent(prompt)
-                }
-                
-                // Update UI on main thread
-                textViewResponse.text = response.text ?: "No response received"
-                
-            } catch (e: Exception) {
-                // Handle errors
-                textViewResponse.text = "Error: ${e.message}"
-                Toast.makeText(this@MainActivity, "Failed to get response", Toast.LENGTH_LONG).show()
-            } finally {
-                // Hide loading state
-                progressBar.visibility = View.GONE
-                buttonSend.isEnabled = true
-            }
-        }
-    }
-}
-
-
- <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
