@@ -9,11 +9,14 @@ private fun callMCPServer(params: JSONObject, callback: (String) -> Unit) {
         .url("$activeMcpUrl/")
         .post(body)
         .addHeader("Content-Type", "application/json")
-        .addHeader("Accept", "application/json")
+        .addHeader("Accept", "text/event-stream, application/json") // Accept SSE
         .build()
+    
+    Log.d("GeminiMcpService", "📤 Sending request: ${params.toString()}")
     
     client.newCall(request).enqueue(object : Callback {
         override fun onFailure(call: Call, e: IOException) {
+            Log.e("GeminiMcpService", "❌ Request failed: ${e.message}")
             callback("Error: ${e.message}")
         }
         
@@ -21,15 +24,23 @@ private fun callMCPServer(params: JSONObject, callback: (String) -> Unit) {
             try {
                 val responseBody = response.body?.string()
                 
-                if (response.isSuccessful) {
-                    if (responseBody != null && responseBody.isNotEmpty()) {
-                        Log.d("GeminiMcpService", "MCP Response: $responseBody")
-                        callback(responseBody)
+                Log.d("GeminiMcpService", "📥 Raw response: $responseBody")
+                
+                if (response.isSuccessful && !responseBody.isNullOrEmpty()) {
+                    // Check if it's SSE format
+                    if (responseBody.contains("event:") && responseBody.contains("")) {
+                        val extractedData = extractDataFromSSE(responseBody)
+                        if (extractedData != null) {
+                            Log.d("GeminiMcpService", "✅ Extracted SSE  $extractedData")
+                            callback(extractedData)
+                        } else {
+                            callback("Error: Failed to extract data from SSE response")
+                        }
                     } else {
-                        callback("Error: Empty response body")
+                        // Regular JSON response
+                        callback(responseBody)
                     }
                 } else {
-                    Log.e("GeminiMcpService", "HTTP Error: ${response.code} - ${response.message}")
                     callback("Error: HTTP ${response.code} - ${response.message}")
                 }
             } catch (e: Exception) {
@@ -42,250 +53,193 @@ private fun callMCPServer(params: JSONObject, callback: (String) -> Unit) {
     })
 }
 
-
-
-
-package com.example.testmcpapp
-
-import android.app.Service
-import android.content.Intent
-import android.os.Binder
-import android.os.IBinder
-import com.google.ai.client.generativeai.GenerativeModel
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.launch
-
-class GeminiService : Service() {
-    
-    private val binder = GeminiBinder()
-    private lateinit var generativeModel: GenerativeModel
-    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    
-    // Interface for communication with activity
-    interface GeminiCallback {
-        fun onResponse(response: String)
-        fun onError(error: String)
-        fun onStarted()
-    }
-    
-    private var callback: GeminiCallback? = null
-    
-    inner class GeminiBinder : Binder() {
-        fun getService(): GeminiService = this@GeminiService
-    }
-    
-    override fun onCreate() {
-        super.onCreate()
-        // Initialize Gemini model
-        generativeModel = GenerativeModel(
-            modelName = "gemini-pro",
-            apiKey = BuildConfig.apiKey
-        )
-    }
-    
-    override fun onBind(intent: Intent): IBinder {
-        return binder
-    }
-    
-    // Method to set callback for communication
-    fun setCallback(callback: GeminiCallback) {
-        this.callback = callback
-    }
-    
-    // Method to remove callback
-    fun removeCallback() {
-        this.callback = null
-    }
-    
-    // Method to send prompt to Gemini
-    fun sendPrompt(prompt: String) {
-        if (prompt.isBlank()) {
-            callback?.onError("Prompt cannot be empty")
-            return
+private fun extractDataFromSSE(sseResponse: String): String? {
+    return try {
+        val lines = sseResponse.split("\n")
+        val dataLines = mutableListOf<String>()
+        
+        for (line in lines) {
+            if (line.startsWith(" ")) {
+                val data = line.substring(6) // Remove " " prefix
+                dataLines.add(data)
+            }
         }
         
-        // Notify that processing started
-        callback?.onStarted()
+        // Join all data lines (in case data spans multiple lines)
+        val combinedData = dataLines.joinToString("")
         
-        // Make API call in background
-        serviceScope.launch {
+        Log.d("GeminiMcpService", "Extracted  $combinedData")
+        
+        // Validate it's valid JSON
+        if (combinedData.isNotEmpty() && (combinedData.startsWith("{") || combinedData.startsWith("["))) {
+            combinedData
+        } else {
+            null
+        }
+    } catch (e: Exception) {
+        Log.e("GeminiMcpService", "Failed to extract SSE data", e)
+        null
+    }
+}
+
+
+
+
+private fun callMCPServer(params: JSONObject, callback: (String) -> Unit) {
+    if (activeMcpUrl == null) {
+        callback("Error: No active MCP server connection")
+        return
+    }
+    
+    val body = RequestBody.create("application/json".toMediaTypeOrNull(), params.toString())
+    val request = Request.Builder()
+        .url("$activeMcpUrl/")
+        .post(body)
+        .addHeader("Content-Type", "application/json")
+        .addHeader("Accept", "text/event-stream, application/json")
+        .addHeader("Cache-Control", "no-cache")
+        .build()
+    
+    Log.d("GeminiMcpService", "📤 Sending request: ${params.toString()}")
+    
+    client.newCall(request).enqueue(object : Callback {
+        override fun onFailure(call: Call, e: IOException) {
+            callback("Error: ${e.message}")
+        }
+        
+        override fun onResponse(call: Call, response: Response) {
             try {
-                val response = generativeModel.generateContent(prompt)
-                val responseText = response.text ?: "No response received"
-                callback?.onResponse(responseText)
+                val responseBody = response.body?.string()
+                
+                if (response.isSuccessful && !responseBody.isNullOrEmpty()) {
+                    val result = parseServerResponse(responseBody)
+                    callback(result)
+                } else {
+                    callback("Error: HTTP ${response.code} - ${response.message}")
+                }
             } catch (e: Exception) {
-                callback?.onError("Error: ${e.message}")
+                callback("Error: ${e.message}")
+            } finally {
+                response.close()
+            }
+        }
+    })
+}
+
+private fun parseServerResponse(response: String): String {
+    return when {
+        // Handle SSE format
+        response.contains("event:") && response.contains("") -> {
+            parseSSEResponse(response)
+        }
+        // Handle regular JSON
+        response.trim().startsWith("{") || response.trim().startsWith("[") -> {
+            response
+        }
+        // Handle other formats
+        else -> {
+            Log.w("GeminiMcpService", "Unknown response format: $response")
+            response
+        }
+    }
+}
+
+private fun parseSSEResponse(sseData: String): String {
+    val events = sseData.split("\n\n") // Split by double newline (event separator)
+    
+    for (event in events) {
+        val lines = event.split("\n")
+        var eventType: String? = null
+        val dataLines = mutableListOf<String>()
+        
+        for (line in lines) {
+            when {
+                line.startsWith("event: ") -> {
+                    eventType = line.substring(7).trim()
+                }
+                line.startsWith(" ") -> {
+                    dataLines.add(line.substring(6))
+                }
+            }
+        }
+        
+        // Process 'message' events (adjust event type as needed)
+        if (eventType == "message" || eventType == null) {
+            val data = dataLines.joinToString("\n")
+            if (data.isNotEmpty()) {
+                Log.d("GeminiMcpService", "📋 SSE Event: $eventType, Data: $data")
+                return data
             }
         }
     }
     
-    override fun onDestroy() {
-        super.onDestroy()
-        callback = null
-    }
+    return "Error: No valid data found in SSE response"
 }
 
 
 
-package com.example.testmcpapp
 
-import android.content.ComponentName
-import android.content.Context
-import android.content.Intent
-import android.content.ServiceConnection
-import android.os.Bundle
-import android.os.IBinder
-import android.widget.Button
-import android.widget.EditText
-import android.widget.TextView
-import android.widget.Toast
-import androidx.appcompat.app.AppCompatActivity
-
-class MainActivity : AppCompatActivity(), GeminiService.GeminiCallback {
-    
-    private lateinit var editTextPrompt: EditText
-    private lateinit var buttonSend: Button
-    private lateinit var textViewResponse: TextView
-    
-    private var geminiService: GeminiService? = null
-    private var isBound = false
-    
-    // Service connection
-    private val serviceConnection = object : ServiceConnection {
-        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
-            val binder = service as GeminiService.GeminiBinder
-            geminiService = binder.getService()
-            geminiService?.setCallback(this@MainActivity)
-            isBound = true
+private fun parseSSEResponse(sseData: String): String {
+    try {
+        Log.d("GeminiMcpService", "🔍 Parsing SSE: $sseData")
+        
+        // Split by double newline to separate events
+        val events = sseData.split(Regex("\n\n|\r\n\r\n"))
+        
+        for (event in events) {
+            if (event.trim().isEmpty()) continue
             
-            // Enable the button once service is connected
-            buttonSend.isEnabled = true
-            buttonSend.text = "Send to Gemini"
+            val lines = event.split(Regex("\n|\r\n"))
+            var eventType: String? = null
+            val dataLines = mutableListOf<String>()
+            
+            for (line in lines) {
+                val trimmedLine = line.trim()
+                when {
+                    trimmedLine.startsWith("event:") -> {
+                        eventType = trimmedLine.substring(6).trim()
+                    }
+                    trimmedLine.startsWith("") -> {
+                        val data = trimmedLine.substring(5).trim()
+                        dataLines.add(data)
+                    }
+                }
+            }
+            
+            if (dataLines.isNotEmpty()) {
+                val combinedData = dataLines.joinToString("")
+                
+                // Validate it's proper JSON
+                if (isValidJSON(combinedData)) {
+                    Log.d("GeminiMcpService", "✅ Valid JSON extracted: $combinedData")
+                    return combinedData
+                } else {
+                    Log.w("GeminiMcpService", "⚠️ Invalid JSON: $combinedData")
+                }
+            }
         }
         
-        override fun onServiceDisconnected(name: ComponentName?) {
-            geminiService?.removeCallback()
-            geminiService = null
-            isBound = false
-            buttonSend.isEnabled = false
-        }
+        return "Error: No valid JSON data found in SSE response"
+    } catch (e: Exception) {
+        Log.e("GeminiMcpService", "Failed to parse SSE response", e)
+        return "Error: SSE parsing failed - ${e.message}"
     }
-    
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
-        
-        // Initialize views
-        editTextPrompt = findViewById(R.id.editTextPrompt)
-        buttonSend = findViewById(R.id.buttonSend)
-        textViewResponse = findViewById(R.id.textViewResponse)
-        
-        // Initially disable button until service connects
-        buttonSend.isEnabled = false
-        buttonSend.text = "Connecting..."
-        
-        // Set button click listener
-        buttonSend.setOnClickListener {
-            sendPromptToGemini()
-        }
-        
-        // Start and bind to service
-        startAndBindService()
-    }
-    
-    private fun startAndBindService() {
-        val intent = Intent(this, GeminiService::class.java)
-        startService(intent) // Start the service
-        bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE) // Bind to service
-    }
-    
-    private fun sendPromptToGemini() {
-        val prompt = editTextPrompt.text.toString().trim()
-        
-        if (prompt.isEmpty()) {
-            Toast.makeText(this, "Please enter a prompt", Toast.LENGTH_SHORT).show()
-            return
-        }
-        
-        if (isBound) {
-            geminiService?.sendPrompt(prompt)
+}
+
+private fun isValidJSON( String): Boolean {
+    return try {
+        if (data.trim().startsWith("{")) {
+            JSONObject(data)
+            true
+        } else if (data.trim().startsWith("[")) {
+            org.json.JSONArray(data)
+            true
         } else {
-            Toast.makeText(this, "Service not connected", Toast.LENGTH_SHORT).show()
+            false
         }
-    }
-    
-    // Callback methods from GeminiService
-    override fun onResponse(response: String) {
-        runOnUiThread {
-            textViewResponse.text = response
-            buttonSend.isEnabled = true
-            buttonSend.text = "Send to Gemini"
-        }
-    }
-    
-    override fun onError(error: String) {
-        runOnUiThread {
-            textViewResponse.text = error
-            buttonSend.isEnabled = true
-            buttonSend.text = "Send to Gemini"
-            Toast.makeText(this@MainActivity, error, Toast.LENGTH_LONG).show()
-        }
-    }
-    
-    override fun onStarted() {
-        runOnUiThread {
-            buttonSend.isEnabled = false
-            buttonSend.text = "Sending..."
-            textViewResponse.text = "Processing your request..."
-        }
-    }
-    
-    override fun onDestroy() {
-        super.onDestroy()
-        if (isBound) {
-            geminiService?.removeCallback()
-            unbindService(serviceConnection)
-            isBound = false
-        }
+    } catch (e: Exception) {
+        false
     }
 }
 
 
-
-<?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    xmlns:tools="http://schemas.android.com/tools">
-    
-    <uses-permission android:name="android.permission.INTERNET" />
-
-    <application
-        android:allowBackup="true"
-        android:dataExtractionRules="@xml/data_extraction_rules"
-        android:fullBackupContent="@xml/backup_rules"
-        android:icon="@mipmap/ic_launcher"
-        android:label="@string/app_name"
-        android:roundIcon="@mipmap/ic_launcher_round"
-        android:supportsRtl="true"
-        android:theme="@style/Theme.AppCompat.Light.DarkActionBar"
-        tools:targetApi="31">
-        
-        <activity
-            android:name=".MainActivity"
-            android:exported="true"
-            android:theme="@style/Theme.AppCompat.Light.DarkActionBar">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
-        
-        <!-- Add the Gemini Service -->
-        <service
-            android:name=".GeminiService"
-            android:enabled="true"
-            android:exported="false" />
-        
-    </application>
-</manifest>
