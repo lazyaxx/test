@@ -1,3 +1,50 @@
+private fun callMCPServer(params: JSONObject, callback: (String) -> Unit) {
+    if (activeMcpUrl == null) {
+        callback("Error: No active MCP server connection")
+        return
+    }
+    
+    val body = RequestBody.create("application/json".toMediaTypeOrNull(), params.toString())
+    val request = Request.Builder()
+        .url("$activeMcpUrl/")
+        .post(body)
+        .addHeader("Content-Type", "application/json")
+        .addHeader("Accept", "application/json")
+        .build()
+    
+    client.newCall(request).enqueue(object : Callback {
+        override fun onFailure(call: Call, e: IOException) {
+            callback("Error: ${e.message}")
+        }
+        
+        override fun onResponse(call: Call, response: Response) {
+            try {
+                val responseBody = response.body?.string()
+                
+                if (response.isSuccessful) {
+                    if (responseBody != null && responseBody.isNotEmpty()) {
+                        Log.d("GeminiMcpService", "MCP Response: $responseBody")
+                        callback(responseBody)
+                    } else {
+                        callback("Error: Empty response body")
+                    }
+                } else {
+                    Log.e("GeminiMcpService", "HTTP Error: ${response.code} - ${response.message}")
+                    callback("Error: HTTP ${response.code} - ${response.message}")
+                }
+            } catch (e: Exception) {
+                Log.e("GeminiMcpService", "Error processing response", e)
+                callback("Error: Failed to process response - ${e.message}")
+            } finally {
+                response.close()
+            }
+        }
+    })
+}
+
+
+
+
 package com.example.testmcpapp
 
 import android.app.Service
