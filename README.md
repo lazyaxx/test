@@ -54,7 +54,7 @@ class GeminiMcpService : Service() {
         super.onCreate()
         generativeModel = GenerativeModel(
             modelName = "gemini-2.5-flash",
-            apiKey = "AIzaSyAVLNJrv9Cl3hXfs--lOuRGvb0hkQ1vtiA"
+            apiKey = "API_KEY"
         )
     }
 
