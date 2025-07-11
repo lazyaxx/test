@@ -15,6 +15,7 @@ import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import org.json.JSONObject
 import java.io.IOException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.ConcurrentHashMap
 
 class GeminiMcpService : Service() {
 
@@ -22,20 +23,22 @@ class GeminiMcpService : Service() {
     private lateinit var generativeModel: GenerativeModel
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
-    // Updated client configuration for SSE support
     private val client = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(0, TimeUnit.MILLISECONDS) // infinite read for SSE
+        .readTimeout(30, TimeUnit.SECONDS) // Set reasonable timeout for SSE
         .retryOnConnectionFailure(true)
         .build()
 
-    private val mcpBaseUrl = "http://192.168.1.77:9000/mcp"
+    private val mcpBaseUrl = "http://10.0.2.2:8000/mcp"
     private var requestId = 1
     private var toolsList: String = ""
     private val previousMcpResponses = mutableListOf<String>()
     private var currentUserQuery = ""
     private var maxIterations = 10
     private var currentIteration = 0
+
+    // Track pending requests to match responses
+    private val pendingRequests = ConcurrentHashMap<Int, (String) -> Unit>()
 
     interface GeminiMcpCallback {
         fun onStatusUpdate(status: String)
@@ -79,10 +82,10 @@ class GeminiMcpService : Service() {
         currentUserQuery = query
         currentIteration = 0
         previousMcpResponses.clear()
+        pendingRequests.clear()
 
         serviceScope.launch {
             try {
-                // Step 1: Select device
                 callback?.onStatusUpdate("Selecting device...")
                 selectDevice()
             } catch (e: Exception) {
@@ -92,9 +95,10 @@ class GeminiMcpService : Service() {
     }
 
     private suspend fun selectDevice() {
+        val currentRequestId = requestId++
         val deviceSelection = JSONObject().apply {
             put("jsonrpc", "2.0")
-            put("id", requestId++)
+            put("id", currentRequestId)
             put("method", "tools/call")
             put("params", JSONObject().apply {
                 put("name", "mobile_use_device")
@@ -105,7 +109,7 @@ class GeminiMcpService : Service() {
             })
         }
 
-        callMCPServer(deviceSelection) { result ->
+        callMCPServer(deviceSelection, currentRequestId) { result ->
             serviceScope.launch {
                 if (result.contains("error")) {
                     callback?.onError("Failed to select device: $result")
@@ -119,20 +123,21 @@ class GeminiMcpService : Service() {
     }
 
     private suspend fun getToolsList() {
+        val currentRequestId = requestId++
         val toolsListRequest = JSONObject().apply {
             put("jsonrpc", "2.0")
-            put("id", requestId++)
+            put("id", currentRequestId)
             put("method", "tools/list")
             put("params", JSONObject())
         }
 
-        callMCPServer(toolsListRequest) { result ->
+        callMCPServer(toolsListRequest, currentRequestId) { result ->
             serviceScope.launch {
                 if (result.contains("error")) {
                     callback?.onError("Failed to get tools list: $result")
                 } else {
-                    toolsList = result // Now this will contain the actual tools data instead of "Accepted"
-                    Log.d("GeminiMcpService", "Tools list received: $toolsList")
+                    toolsList = result
+                    Log.d("GeminiMcpService", "Fresh tools list received: $toolsList")
                     callback?.onStatusUpdate("Starting task execution...")
                     startGeminiMcpLoop()
                 }
@@ -157,7 +162,6 @@ class GeminiMcpService : Service() {
 
             Log.d("GeminiMcpService", "Gemini response: $responseText")
 
-            // Check if Gemini indicates completion
             if (responseText.contains("TASK_COMPLETED") ||
                 responseText.contains("\"status\": \"completed\"") ||
                 responseText.contains("task is complete")) {
@@ -166,16 +170,15 @@ class GeminiMcpService : Service() {
                 return
             }
 
-            // Try to extract JSON from Gemini response
             val jsonResponse = extractJsonFromResponse(responseText)
             if (jsonResponse != null) {
-                // Send to MCP server
-                callMCPServer(jsonResponse) { mcpResult ->
+                val currentRequestId = requestId++
+                jsonResponse.put("id", currentRequestId) // Ensure fresh ID
+                
+                callMCPServer(jsonResponse, currentRequestId) { mcpResult ->
                     serviceScope.launch {
                         previousMcpResponses.add(mcpResult)
-                        Log.d("GeminiMcpService", "MCP response: $mcpResult")
-
-                        // Continue loop
+                        Log.d("GeminiMcpService", "Fresh MCP response: $mcpResult")
                         startGeminiMcpLoop()
                     }
                 }
@@ -209,7 +212,7 @@ class GeminiMcpService : Service() {
             RESPONSE FORMAT (choose one):
             
             For MCP tool call:
-            {"jsonrpc": "2.0", "id": $requestId, "method": "tools/call", "params": {"name": "tool_name", "arguments": {"param": "value"}}}
+            {"jsonrpc": "2.0", "id": ${requestId}, "method": "tools/call", "params": {"name": "tool_name", "arguments": {"param": "value"}}}
             
             For completion:
             {"status": "completed", "message": "Task completed successfully"}
@@ -225,10 +228,7 @@ class GeminiMcpService : Service() {
 
     private fun extractJsonFromResponse(response: String): JSONObject? {
         return try {
-            // Try to find JSON in the response
             val trimmed = response.trim()
-
-            // Look for JSON object boundaries
             val startIndex = trimmed.indexOf('{')
             val endIndex = trimmed.lastIndexOf('}')
 
@@ -244,8 +244,13 @@ class GeminiMcpService : Service() {
         }
     }
 
-    // Updated callMCPServer function to handle SSE properly
-    private fun callMCPServer(params: JSONObject, callback: (String) -> Unit) {
+    // Improved callMCPServer function that ensures fresh data every time
+    private fun callMCPServer(params: JSONObject, requestId: Int, callback: (String) -> Unit) {
+        // Store the callback for this specific request
+        pendingRequests[requestId] = callback
+        
+        Log.d("GeminiMcpService", "Sending request ID: $requestId")
+        
         val body = RequestBody.create("application/json".toMediaTypeOrNull(), params.toString())
         val postRequest = Request.Builder()
             .url("$mcpBaseUrl/")
@@ -254,153 +259,115 @@ class GeminiMcpService : Service() {
 
         client.newCall(postRequest).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
+                pendingRequests.remove(requestId)
                 callback("Error: ${e.message}")
             }
 
             override fun onResponse(call: Call, response: Response) {
                 if (!response.isSuccessful) {
+                    pendingRequests.remove(requestId)
                     callback("Error: HTTP ${response.code}")
                     return
                 }
 
-                // After POST is successful, start listening to SSE
-                val getRequest = Request.Builder()
-                    .url("$mcpBaseUrl/")
-                    .get()
-                    .build()
-
-                // Execute SSE listening in a new thread to avoid blocking
-                Thread {
-                    try {
-                        client.newCall(getRequest).execute().use { sseResponse ->
-                            if (!sseResponse.isSuccessful) {
-                                callback("Error: SSE connection failed with code ${sseResponse.code}")
-                                return@use
-                            }
-
-                            val reader = sseResponse.body?.charStream()?.buffered() ?: run {
-                                callback("Error: SSE response body is null")
-                                return@use
-                            }
-
-                            var event: String? = null
-                            val dataBuilder = StringBuilder()
-
-                            while (true) {
-                                val line = reader.readLine() ?: break
-                                when {
-                                    line.startsWith("event:") -> {
-                                        event = line.removePrefix("event:").trim()
-                                    }
-                                    line.startsWith("data:") -> {
-                                        dataBuilder.append(line.removePrefix("data:").trim())
-                                    }
-                                    line.isEmpty() -> {
-                                        val fullData = dataBuilder.toString()
-                                        if (event != null && fullData.isNotEmpty()) {
-                                            Log.d("GeminiMcpService", "SSE Data received: $fullData")
-                                            callback(fullData)
-                                            return@use // Exit after receiving the first complete SSE message
-                                        }
-                                        event = null
-                                        dataBuilder.setLength(0)
-                                    }
-                                }
-                            }
-                        }
-                    } catch (e: Exception) {
-                        Log.e("GeminiMcpService", "SSE listening failed: ${e.message}")
-                        callback("Error: SSE listening failed: ${e.message}")
-                    }
-                }.start()
+                Log.d("GeminiMcpService", "POST successful for request ID: $requestId")
+                
+                // Start fresh SSE connection for this request
+                startFreshSSEConnection(requestId)
             }
         })
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        callback = null
-    }
-}
+    private fun startFreshSSEConnection(requestId: Int) {
+        val getRequest = Request.Builder()
+            .url("$mcpBaseUrl/")
+            .get()
+            .build()
 
+        Thread {
+            try {
+                client.newCall(getRequest).execute().use { sseResponse ->
+                    if (!sseResponse.isSuccessful) {
+                        val callback = pendingRequests.remove(requestId)
+                        callback?.invoke("Error: SSE connection failed with code ${sseResponse.code}")
+                        return@use
+                    }
 
+                    val reader = sseResponse.body?.charStream()?.buffered() ?: run {
+                        val callback = pendingRequests.remove(requestId)
+                        callback?.invoke("Error: SSE response body is null")
+                        return@use
+                    }
 
+                    var event: String? = null
+                    val dataBuilder = StringBuilder()
+                    var messageCount = 0
+                    val maxMessages = 10 // Prevent infinite reading
 
-
-
-private fun callMCPServer(params: JSONObject, callback: (String) -> Unit) {
-    val body = RequestBody.create("application/json".toMediaTypeOrNull(), params.toString())
-    val postRequest = Request.Builder()
-        .url("$mcpBaseUrl/")
-        .post(body)
-        .build()
-
-    client.newCall(postRequest).enqueue(object : Callback {
-        override fun onFailure(call: Call, e: IOException) {
-            callback("Error: ${e.message}")
-        }
-
-        override fun onResponse(call: Call, response: Response) {
-            if (!response.isSuccessful) {
-                callback("Error: HTTP ${response.code}")
-                return
-            }
-
-            // After POST is successful, start listening to SSE
-            val getRequest = Request.Builder()
-                .url("$mcpBaseUrl/")
-                .get()
-                .build()
-
-            // Execute SSE listening in a new thread to avoid blocking
-            Thread {
-                try {
-                    client.newCall(getRequest).execute().use { sseResponse ->
-                        if (!sseResponse.isSuccessful) {
-                            callback("Error: SSE connection failed with code ${sseResponse.code}")
-                            return@use
-                        }
-
-                        val reader = sseResponse.body?.charStream()?.buffered() ?: run {
-                            callback("Error: SSE response body is null")
-                            return@use
-                        }
-
-                        var event: String? = null
-                        val dataBuilder = StringBuilder()
-
-                        while (true) {
-                            val line = reader.readLine() ?: break
-                            when {
-                                line.startsWith("event:") -> {
-                                    event = line.removePrefix("event:").trim()
+                    while (messageCount < maxMessages) {
+                        val line = reader.readLine() ?: break
+                        
+                        when {
+                            line.startsWith("event:") -> {
+                                event = line.removePrefix("event:").trim()
+                            }
+                            line.startsWith("") -> {
+                                if (dataBuilder.isNotEmpty()) {
+                                    dataBuilder.append("\n")
                                 }
-                                line.startsWith("data:") -> {
-                                    dataBuilder.append(line.removePrefix("data:").trim())
-                                }
-                                line.isEmpty() -> {
-                                    val fullData = dataBuilder.toString()
-                                    if (event != null && fullData.isNotEmpty()) {
-                                        callback(fullData)
-                                        return@use // Exit after receiving the first complete SSE message
+                                dataBuilder.append(line.removePrefix("").trim())
+                            }
+                            line.isEmpty() -> {
+                                val fullData = dataBuilder.toString()
+                                if (event != null && fullData.isNotEmpty()) {
+                                    messageCount++
+                                    Log.d("GeminiMcpService", "SSE Message $messageCount: event=$event, data=$fullData")
+                                    
+                                    // Try to parse JSON and match request ID
+                                    try {
+                                        val jsonData = JSONObject(fullData)
+                                        val responseId = jsonData.optInt("id", -1)
+                                        
+                                        if (responseId == requestId) {
+                                            Log.d("GeminiMcpService", "✅ Matched response for request ID: $requestId")
+                                            val callback = pendingRequests.remove(requestId)
+                                            callback?.invoke(fullData)
+                                            return@use
+                                        } else {
+                                            Log.d("GeminiMcpService", "⚠️ ID mismatch: expected $requestId, got $responseId")
+                                        }
+                                    } catch (e: Exception) {
+                                        Log.w("GeminiMcpService", "Non-JSON SSE  $fullData")
+                                        // If it's not JSON, might still be valid response
+                                        val callback = pendingRequests.remove(requestId)
+                                        callback?.invoke(fullData)
+                                        return@use
                                     }
-                                    event = null
-                                    dataBuilder.setLength(0)
                                 }
+                                
+                                // Reset for next message
+                                event = null
+                                dataBuilder.setLength(0)
                             }
                         }
                     }
-                } catch (e: Exception) {
-                    callback("Error: SSE listening failed: ${e.message}")
+                    
+                    // If we reach here, no matching response found
+                    Log.w("GeminiMcpService", "No matching response found for request ID: $requestId")
+                    val callback = pendingRequests.remove(requestId)
+                    callback?.invoke("Error: No matching response received")
                 }
-            }.start()
-        }
-    })
+            } catch (e: Exception) {
+                Log.e("GeminiMcpService", "SSE connection error for request ID $requestId: ${e.message}")
+                val callback = pendingRequests.remove(requestId)
+                callback?.invoke("Error: SSE connection failed: ${e.message}")
+            }
+        }.start()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        pendingRequests.clear()
+        callback = null
+    }
 }
-
-
-private val client = OkHttpClient.Builder()
-    .connectTimeout(10, TimeUnit.SECONDS)
-    .readTimeout(0, TimeUnit.MILLISECONDS) // infinite read for SSE
-    .retryOnConnectionFailure(true)
-    .build()
