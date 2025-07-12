@@ -73,7 +73,7 @@ class GeminiMcpService : Service() {
         super.onCreate()
         generativeModel = GenerativeModel(
             modelName = "gemini-2.5-flash",
-            apiKey = "AIzaSyDctsM-jh2gXX6xAttGow1h0fI1fqwcR0s"
+            apiKey = "API_KEY"
         )
 
         // Acquire wake lock to prevent system sleep
