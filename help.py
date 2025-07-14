@@ -3,7 +3,12 @@
 package com.example.mcpapp
 
 import android.app.*
+import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
@@ -33,22 +38,22 @@ import java.util.concurrent.atomic.AtomicBoolean
 class GeminiMcpService : Service() {
 
     companion object {
-        const val NOTIFICATION_ID = 1001
-        const val CHANNEL_ID = "gemini_mcp_service_channel"
-        const val ACTION_STOP_SERVICE = "com.example.mcpapp.STOP_SERVICE"
+        private const val NOTIFICATION_ID = 1001
+        private const val CHANNEL_ID = "GeminiMcpService"
+        private const val CHANNEL_NAME = "Gemini MCP Background Service"
     }
 
     private val client = OkHttpClient.Builder()
-        .connectTimeout(45, TimeUnit.SECONDS)
-        .readTimeout(45, TimeUnit.SECONDS)
-        .writeTimeout(45, TimeUnit.SECONDS)
+        .connectTimeout(60, TimeUnit.SECONDS)
+        .readTimeout(0, TimeUnit.SECONDS) // No read timeout for SSE
+        .writeTimeout(30, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
-        .pingInterval(20, TimeUnit.SECONDS)
+        .pingInterval(45, TimeUnit.SECONDS)
         .addNetworkInterceptor { chain ->
             val request = chain.request().newBuilder()
                 .addHeader("Connection", "keep-alive")
                 .addHeader("Cache-Control", "no-cache")
-                .addHeader("Keep-Alive", "timeout=300, max=1000")
+                .addHeader("Accept", "text/event-stream")
                 .build()
             chain.proceed(request)
         }
@@ -61,23 +66,25 @@ class GeminiMcpService : Service() {
     private lateinit var generativeModel: GenerativeModel
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
-    // Enhanced wake lock management
+    // Wake lock to prevent system from sleeping
     private lateinit var wakeLock: WakeLock
-    private lateinit var wifiLock: WifiManager.WifiLock
+    
+    // Network callback for handling network changes
+    private lateinit var connectivityManager: ConnectivityManager
+    private lateinit var networkCallback: ConnectivityManager.NetworkCallback
 
     private var requestId = 1
     private var pendingRequestId: Int? = null
     private var responseChannel: Channel<String>? = null
     private val isListening = AtomicBoolean(false)
     private val shouldReconnect = AtomicBoolean(true)
-    private val isServiceRunning = AtomicBoolean(false)
+    private val isTaskRunning = AtomicBoolean(false)
 
     private var currentUserQuery = ""
-    private var maxIterations = 20 // Increased for complex operations
+    private var maxIterations = 20
     private var currentIteration = 0
-    private val maxRetries = 5 // Increased retries
-    private var connectionRetryCount = 0
-    private val maxConnectionRetries = 10
+    private val maxRetries = 5
+    private val connectionRetryDelay = 3000L
 
     interface GeminiMcpCallback {
         fun onStatusUpdate(status: String)
@@ -94,90 +101,97 @@ class GeminiMcpService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        
+        createNotificationChannel()
+        startForeground(NOTIFICATION_ID, createNotification("Service starting..."))
 
         generativeModel = GenerativeModel(
             modelName = "gemini-2.5-flash",
-            apiKey = "AIzaSyDp_sEGHS_JBdjp5M_vbB81HdCcwzPgIOE"
+            apiKey = "API_KEY"
         )
 
-        createNotificationChannel()
-        acquireLocks()
-        isServiceRunning.set(true)
+        // Acquire a more persistent wake lock
+        val powerManager = getSystemService(POWER_SERVICE) as PowerManager
+        wakeLock = powerManager.newWakeLock(
+            PowerManager.PARTIAL_WAKE_LOCK, 
+            "GeminiMcpService:PersistentWakeLock"
+        )
+        wakeLock.acquire(60*60*1000L) // 1 hour wake lock
+
+        setupNetworkMonitoring()
+        
+        Log.d("GeminiMcpService", "Service created and started as foreground service")
     }
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 CHANNEL_ID,
-                "Gemini MCP Service",
+                CHANNEL_NAME,
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Background automation service"
-                setSound(null, null)
-                enableVibration(false)
+                description = "Keeps Gemini MCP automation running in background"
                 setShowBadge(false)
             }
-
+            
             val notificationManager = getSystemService(NotificationManager::class.java)
             notificationManager.createNotificationChannel(channel)
         }
     }
 
-    private fun createNotification(status: String = "Running automation..."): Notification {
-        val stopIntent = Intent(this, GeminiMcpService::class.java).apply {
-            action = ACTION_STOP_SERVICE
-        }
-        val stopPendingIntent = PendingIntent.getService(
-            this, 0, stopIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
-        val mainIntent = Intent(this, MainActivity::class.java)
-        val mainPendingIntent = PendingIntent.getActivity(
-            this, 0, mainIntent,
+    private fun createNotification(message: String): Notification {
+        val intent = Intent(this, MainActivity::class.java)
+        val pendingIntent = PendingIntent.getActivity(
+            this, 0, intent, 
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("MCP Automation Active")
-            .setContentText(status)
-            .setSmallIcon(android.R.drawable.ic_media_play)
+            .setContentTitle("Gemini MCP Automation")
+            .setContentText(message)
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setContentIntent(pendingIntent)
             .setOngoing(true)
-            .setSilent(true)
-            .setContentIntent(mainPendingIntent)
-            .addAction(
-                android.R.drawable.ic_media_pause,
-                "Stop",
-                stopPendingIntent
-            )
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .build()
     }
 
-    private fun acquireLocks() {
-        // Enhanced wake lock
-        val powerManager = getSystemService(POWER_SERVICE) as PowerManager
-        wakeLock = powerManager.newWakeLock(
-            PowerManager.PARTIAL_WAKE_LOCK,
-            "GeminiMcpService:WakeLock"
-        )
-        wakeLock.acquire(30*60*1000L) // 30 minutes
-
-        // WiFi lock to maintain network connectivity
-        val wifiManager = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
-        wifiLock = wifiManager.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "GeminiMcpService:WifiLock")
-        wifiLock.acquire()
+    private fun updateNotification(message: String) {
+        val notification = createNotification(message)
+        val notificationManager = getSystemService(NotificationManager::class.java)
+        notificationManager.notify(NOTIFICATION_ID, notification)
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            ACTION_STOP_SERVICE -> {
-                stopSelf()
-                return START_NOT_STICKY
+    private fun setupNetworkMonitoring() {
+        connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        
+        networkCallback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                Log.d("GeminiMcpService", "Network available, reconnecting if needed")
+                if (isTaskRunning.get() && !isListening.get()) {
+                    serviceScope.launch {
+                        delay(2000) // Wait a bit for network to stabilize
+                        restartSSEListener()
+                    }
+                }
+            }
+
+            override fun onLost(network: Network) {
+                Log.d("GeminiMcpService", "Network lost")
             }
         }
 
-        startForeground(NOTIFICATION_ID, createNotification())
-        return START_STICKY
+        val networkRequest = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .build()
+            
+        connectivityManager.registerNetworkCallback(networkRequest, networkCallback)
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        Log.d("GeminiMcpService", "onStartCommand called")
+        return START_STICKY // Restart service if killed
     }
 
     override fun onBind(intent: Intent): IBinder {
@@ -192,37 +206,34 @@ class GeminiMcpService : Service() {
         this.callback = null
     }
 
-    private fun updateNotification(status: String) {
-        val notificationManager = getSystemService(NotificationManager::class.java)
-        notificationManager.notify(NOTIFICATION_ID, createNotification(status))
-    }
-
     fun processUserQuery(query: String) {
         if (query.isBlank()) {
             callback?.onError("Query cannot be empty")
             return
         }
 
+        if (isTaskRunning.get()) {
+            callback?.onError("Another task is already running")
+            return
+        }
+
         currentUserQuery = query
         currentIteration = 0
-        connectionRetryCount = 0
         shouldReconnect.set(true)
+        isTaskRunning.set(true)
+
+        updateNotification("Processing: $query")
 
         serviceScope.launch {
             try {
-                updateNotification("Initializing automation...")
                 callback?.onStatusUpdate("Initializing automation...")
 
-                // Ensure service is in foreground
-                startForeground(NOTIFICATION_ID, createNotification("Initializing..."))
-
-                // Start SSE listener with enhanced retry logic
+                // Start SSE listener first
                 startSSEListener()
 
-                // Longer delay to ensure stable connection
+                // Wait longer for connection establishment
                 delay(3000)
 
-                updateNotification("Connecting to device...")
                 callback?.onStatusUpdate("Selecting device...")
                 selectDevice()
                 Log.d("selectDevice", "device selected")
@@ -230,12 +241,12 @@ class GeminiMcpService : Service() {
                 getToolsList()
                 Log.d("getToolsList", "got tools $toolsList")
 
-                updateNotification("Processing automation...")
                 startGeminiMcpLoop()
             } catch (e: Exception) {
-                updateNotification("Error occurred")
                 callback?.onError("Error processing query: ${e.message}")
                 Log.e("GeminiMcpService", "Error in processUserQuery", e)
+                isTaskRunning.set(false)
+                updateNotification("Error: ${e.message}")
             }
         }
     }
@@ -286,6 +297,7 @@ class GeminiMcpService : Service() {
         return withContext(Dispatchers.IO) {
             responseChannel = Channel(Channel.UNLIMITED)
 
+            // Wait for response with longer timeout and more retries
             var attempts = 0
             while (attempts < maxRetries) {
                 try {
@@ -295,9 +307,10 @@ class GeminiMcpService : Service() {
                     attempts++
                     Log.e("GeminiMcpService", "Error waiting for response, attempt $attempts", e)
                     if (attempts < maxRetries) {
-                        delay(3000) // Longer delay between retries
+                        delay(connectionRetryDelay)
                         if (!isListening.get()) {
                             restartSSEListener()
+                            delay(2000) // Wait for connection to establish
                         }
                     }
                 }
@@ -313,10 +326,13 @@ class GeminiMcpService : Service() {
         }
 
         isListening.set(true)
-        connectionRetryCount = 0
+        Log.d("MCPService", "Starting SSE listener...")
 
         executor.execute {
-            while (shouldReconnect.get() && !executor.isShutdown && isServiceRunning.get()) {
+            var consecutiveErrors = 0
+            val maxConsecutiveErrors = 5
+            
+            while (shouldReconnect.get() && !executor.isShutdown && consecutiveErrors < maxConsecutiveErrors) {
                 try {
                     Log.d("MCPService", "Attempting SSE connection...")
                     
@@ -326,36 +342,29 @@ class GeminiMcpService : Service() {
                         .header("Cache-Control", "no-cache")
                         .header("Accept", "text/event-stream")
                         .header("Connection", "keep-alive")
-                        .header("Keep-Alive", "timeout=300")
+                        .header("User-Agent", "GeminiMcpService/1.0")
                         .build()
 
                     client.newCall(getRequest).execute().use { response ->
                         if (!response.isSuccessful) {
                             Log.e("MCPService", "❌ Failed SSE connection: ${response.code}")
-                            connectionRetryCount++
-                            if (connectionRetryCount < maxConnectionRetries) {
-                                Thread.sleep(5000)
-                                continue
-                            } else {
-                                callback?.onError("Failed to establish stable connection after $maxConnectionRetries attempts")
-                                return@execute
-                            }
+                            consecutiveErrors++
+                            Thread.sleep(connectionRetryDelay)
+                            return@use
                         }
 
                         Log.d("MCPService", "✅ SSE connection established")
-                        connectionRetryCount = 0 // Reset on successful connection
+                        consecutiveErrors = 0 // Reset error counter on successful connection
 
                         val reader = BufferedReader(InputStreamReader(response.body?.byteStream()))
                         var event: String? = null
                         val dataBuilder = StringBuilder()
                         var line: String?
-                        var lastDataTime = System.currentTimeMillis()
+                        var lastActivity = System.currentTimeMillis()
 
-                        while (reader.readLine().also { line = it } != null && 
-                               shouldReconnect.get() && isServiceRunning.get()) {
-                            
+                        while (reader.readLine().also { line = it } != null && shouldReconnect.get()) {
+                            lastActivity = System.currentTimeMillis()
                             line = line?.trim()
-                            lastDataTime = System.currentTimeMillis()
                             
                             when {
                                 line!!.startsWith("event:") -> {
@@ -411,53 +420,53 @@ class GeminiMcpService : Service() {
                                     dataBuilder.setLength(0)
                                 }
                             }
-
+                            
                             // Check for connection timeout
-                            if (System.currentTimeMillis() - lastDataTime > 60000) { // 60 seconds timeout
-                                Log.w("MCPService", "SSE connection timeout, reconnecting...")
+                            if (System.currentTimeMillis() - lastActivity > 120000) { // 2 minutes
+                                Log.w("MCPService", "No activity for 2 minutes, reconnecting...")
                                 break
                             }
                         }
                     }
                 } catch (e: Exception) {
-                    Log.e("MCPService", "❌ SSE error: ${e.message}")
-                    connectionRetryCount++
-                    if (shouldReconnect.get() && isServiceRunning.get() && connectionRetryCount < maxConnectionRetries) {
-                        Log.d("MCPService", "Retrying connection in 5 seconds... (attempt $connectionRetryCount/$maxConnectionRetries)")
-                        Thread.sleep(5000)
-                    } else if (connectionRetryCount >= maxConnectionRetries) {
-                        callback?.onError("Connection failed after $maxConnectionRetries attempts")
-                        break
+                    consecutiveErrors++
+                    Log.e("MCPService", "❌ SSE error (attempt $consecutiveErrors): ${e.message}")
+                    if (shouldReconnect.get() && consecutiveErrors < maxConsecutiveErrors) {
+                        Thread.sleep(connectionRetryDelay * consecutiveErrors) // Exponential backoff
                     }
                 }
             }
+            
+            if (consecutiveErrors >= maxConsecutiveErrors) {
+                Log.e("MCPService", "Too many consecutive errors, stopping SSE listener")
+                callback?.onError("Connection failed after multiple attempts")
+            }
+            
             isListening.set(false)
-            Log.d("MCPService", "SSE listener stopped")
         }
     }
 
     private fun restartSSEListener() {
         Log.d("MCPService", "Restarting SSE listener...")
         isListening.set(false)
-        Thread.sleep(2000) // Longer pause before restart
-        if (shouldReconnect.get() && isServiceRunning.get()) {
-            startSSEListener()
-        }
+        Thread.sleep(2000) // Longer pause for cleanup
+        startSSEListener()
     }
 
     private var fullMcpResponses = ""
 
     private suspend fun startGeminiMcpLoop() {
         if (currentIteration >= maxIterations) {
-            updateNotification("Maximum iterations reached")
             callback?.onError("Maximum iterations reached. Task may be too complex.")
+            isTaskRunning.set(false)
+            updateNotification("Task incomplete - max iterations reached")
             return
         }
 
         currentIteration++
-        val status = "Processing step $currentIteration of $maxIterations..."
-        updateNotification(status)
-        callback?.onStatusUpdate(status)
+        val statusMsg = "Processing step $currentIteration of $maxIterations..."
+        callback?.onStatusUpdate(statusMsg)
+        updateNotification(statusMsg)
 
         val geminiPrompt = createGeminiPrompt()
         Log.d("Gemini", "Prompt: $geminiPrompt")
@@ -471,10 +480,10 @@ class GeminiMcpService : Service() {
             if (responseText.contains("TASK_COMPLETED") ||
                 responseText.contains("\"status\": \"completed\"") ||
                 responseText.contains("task is complete")) {
-                
-                updateNotification("Task completed")
                 callback?.onResponse("Task completed successfully!")
                 callback?.onCompleted()
+                isTaskRunning.set(false)
+                updateNotification("Task completed successfully")
                 return
             }
 
@@ -484,13 +493,6 @@ class GeminiMcpService : Service() {
                 pendingRequestId = currentRequestId
                 jsonResponse.put("id", currentRequestId)
 
-                // Ensure connection is still alive before sending
-                if (!isListening.get()) {
-                    Log.w("GeminiMcpService", "SSE connection lost, attempting to reconnect...")
-                    restartSSEListener()
-                    delay(3000) // Wait for reconnection
-                }
-
                 sendJsonRpcRequestWithRetry(jsonResponse)
                 val mcpResponse = waitForResponse()
                 fullMcpResponses += "\n" + mcpResponse
@@ -498,18 +500,22 @@ class GeminiMcpService : Service() {
 
                 Log.i("requestId: $requestId", "full response: $fullMcpResponses")
 
-                // Longer delay between iterations for stability
+                // Add delay between iterations
                 delay(2000)
 
                 // Continue the loop
                 startGeminiMcpLoop()
             } else {
                 callback?.onError("Failed to parse Gemini response as JSON: $responseText")
+                isTaskRunning.set(false)
+                updateNotification("Error parsing Gemini response")
             }
 
         } catch (e: Exception) {
             Log.e("GeminiMcpService", "Error in Gemini loop", e)
             callback?.onError("Error communicating with Gemini: ${e.message}")
+            isTaskRunning.set(false)
+            updateNotification("Error: ${e.message}")
         }
     }
 
@@ -523,12 +529,11 @@ class GeminiMcpService : Service() {
                 attempts++
                 Log.e("MCPService", "Send request failed, attempt $attempts", e)
                 if (attempts < maxRetries) {
-                    delay(3000) // Longer delay between send retries
-                    
-                    // Check if we need to restart SSE connection
+                    delay(connectionRetryDelay)
+                    // Check if SSE connection is still alive
                     if (!isListening.get()) {
                         restartSSEListener()
-                        delay(2000)
+                        delay(3000) // Wait for reconnection
                     }
                 }
             }
@@ -543,7 +548,7 @@ class GeminiMcpService : Service() {
         val postRequest = Request.Builder()
             .url(mcpUrl)
             .post(requestBody)
-            .header("Connection", "keep-alive")
+            .header("Content-Type", "application/json")
             .build()
 
         client.newCall(postRequest).enqueue(object : Callback {
@@ -567,7 +572,7 @@ class GeminiMcpService : Service() {
         return """
             You are an AI assistant that controls mobile devices through an MCP server.
             Your task is to help execute user queries by calling the appropriate mobile device tools.
-            The service is running in the background and can interact with any app on the device.
+            Remember that the device is already selected and start with the user query.
             
             AVAILABLE TOOLS:
             $toolsList
@@ -581,8 +586,6 @@ class GeminiMcpService : Service() {
             1. Respond with ONLY valid JSON - no markdown formatting, no code blocks, no extra text
             2. If task is complete, respond with: {"status": "completed", "message": "Task completed successfully"}
             3. Otherwise, respond with the exact MCP JSON format shown below
-            4. Be patient with app transitions and UI loading times
-            5. If an app needs time to load, consider using appropriate waiting tools
             
             RESPONSE FORMAT (choose one):
             
@@ -597,8 +600,8 @@ class GeminiMcpService : Service() {
             - NO additional text or explanations
             - ONLY JSON response
             - Use exact tool names from the tools list
-            - Consider app switching delays and UI loading times
             - Think about what action is needed next based on user query and previous responses
+            - Be patient with UI interactions - some actions may take time to complete
         """.trimIndent()
     }
 
@@ -622,29 +625,26 @@ class GeminiMcpService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        Log.d("GeminiMcpService", "Service being destroyed")
         
-        isServiceRunning.set(false)
         callback = null
         shouldReconnect.set(false)
         isListening.set(false)
+        isTaskRunning.set(false)
         responseChannel?.close()
         executor.shutdown()
 
-        // Release all locks
-        if (::wakeLock.isInitialized && wakeLock.isHeld) {
+        try {
+            connectivityManager.unregisterNetworkCallback(networkCallback)
+        } catch (e: Exception) {
+            Log.e("GeminiMcpService", "Error unregistering network callback", e)
+        }
+
+        if (wakeLock.isHeld) {
             wakeLock.release()
         }
-        if (::wifiLock.isInitialized && wifiLock.isHeld) {
-            wifiLock.release()
-        }
-
-        // Stop foreground service
-        stopForeground(true)
-        
-        Log.d("GeminiMcpService", "Service destroyed")
     }
 }
-
 
 
 
@@ -662,6 +662,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.os.PowerManager
 import android.provider.Settings
 import android.widget.Button
 import android.widget.EditText
@@ -680,36 +681,28 @@ class MainActivity : AppCompatActivity() {
     private lateinit var buttonStop: Button
     private lateinit var textViewStatus: TextView
     private lateinit var textViewResponse: TextView
-    private lateinit var textViewServiceStatus: TextView
+    private lateinit var textViewPermissions: TextView
 
     private var geminiMcpService: GeminiMcpService? = null
     private var bound = false
     private var serviceStarted = false
 
-    companion object {
-        private const val PERMISSION_REQUEST_CODE = 1001
-        private const val OVERLAY_PERMISSION_REQUEST_CODE = 1002
-    }
-
-    private val permissionLauncher = registerForActivityResult(
+    private val requestPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
-        val allGranted = permissions.all { it.value }
+        val allGranted = permissions.values.all { it }
         if (allGranted) {
-            checkOverlayPermission()
+            updatePermissionStatus()
+            checkBatteryOptimization()
         } else {
-            showPermissionDeniedDialog()
+            showPermissionDialog()
         }
     }
 
-    private val overlayPermissionLauncher = registerForActivityResult(
+    private val batteryOptimizationLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && Settings.canDrawOverlays(this)) {
-            initializeService()
-        } else {
-            showOverlayPermissionDeniedDialog()
-        }
+        updatePermissionStatus()
     }
 
     private val connection = object : ServiceConnection {
@@ -717,51 +710,53 @@ class MainActivity : AppCompatActivity() {
             val binder = service as GeminiMcpService.GeminiMcpBinder
             geminiMcpService = binder.getService()
             bound = true
-            updateServiceStatus("Connected")
 
             // Set callback for service responses
             geminiMcpService?.setCallback(object : GeminiMcpService.GeminiMcpCallback {
                 override fun onStatusUpdate(status: String) {
                     runOnUiThread {
                         textViewStatus.text = status
-                        updateServiceStatus("Running: $status")
                     }
                 }
 
                 override fun onResponse(response: String) {
                     runOnUiThread {
                         textViewResponse.text = response
-                        buttonSend.isEnabled = true
-                        buttonStop.isEnabled = false
-                        updateServiceStatus("Task completed")
+                        enableControls(true)
                     }
                 }
 
                 override fun onError(error: String) {
                     runOnUiThread {
                         textViewResponse.text = "Error: $error"
-                        textViewStatus.text = "Error occurred"
-                        buttonSend.isEnabled = true
-                        buttonStop.isEnabled = false
-                        updateServiceStatus("Error: $error")
+                        textViewStatus.text = "Ready"
+                        enableControls(true)
+                        
+                        // Show error dialog for critical errors
+                        if (error.contains("connection") || error.contains("network")) {
+                            showErrorDialog("Connection Error", error)
+                        }
                     }
                 }
 
                 override fun onCompleted() {
                     runOnUiThread {
                         textViewStatus.text = "Task completed successfully"
-                        buttonSend.isEnabled = true
-                        buttonStop.isEnabled = false
-                        updateServiceStatus("Task completed successfully")
+                        enableControls(true)
+                        
+                        // Show completion notification
+                        Toast.makeText(this@MainActivity, "Automation completed!", Toast.LENGTH_SHORT).show()
                     }
                 }
             })
+
+            updateServiceStatus()
         }
 
         override fun onServiceDisconnected(arg0: ComponentName) {
             bound = false
             geminiMcpService = null
-            updateServiceStatus("Disconnected")
+            updateServiceStatus()
         }
     }
 
@@ -771,7 +766,10 @@ class MainActivity : AppCompatActivity() {
 
         initializeViews()
         setupClickListeners()
-        checkPermissions()
+        
+        // Check and request permissions
+        checkAndRequestPermissions()
+        updatePermissionStatus()
     }
 
     private fun initializeViews() {
@@ -780,178 +778,65 @@ class MainActivity : AppCompatActivity() {
         buttonStop = findViewById(R.id.buttonStop)
         textViewStatus = findViewById(R.id.textViewStatus)
         textViewResponse = findViewById(R.id.textViewResponse)
-        textViewServiceStatus = findViewById(R.id.textViewServiceStatus)
-
+        textViewPermissions = findViewById(R.id.textViewPermissions)
+        
         // Set initial states
-        buttonSend.isEnabled = false
         buttonStop.isEnabled = false
-        updateServiceStatus("Checking permissions...")
+        textViewStatus.text = "Ready"
     }
 
     private fun setupClickListeners() {
         buttonSend.setOnClickListener {
             val prompt = editTextPrompt.text.toString().trim()
             if (prompt.isNotEmpty()) {
-                startAutomation(prompt)
+                if (checkAllPermissions()) {
+                    startAutomationTask(prompt)
+                } else {
+                    checkAndRequestPermissions()
+                }
             } else {
-                Toast.makeText(this, "Please enter a command", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "Please enter a query", Toast.LENGTH_SHORT).show()
             }
         }
 
         buttonStop.setOnClickListener {
-            stopAutomation()
+            stopAutomationTask()
+        }
+
+        textViewPermissions.setOnClickListener {
+            checkAndRequestPermissions()
         }
     }
 
-    private fun startAutomation(prompt: String) {
-        if (!bound || geminiMcpService == null) {
-            Toast.makeText(this, "Service not connected. Please wait...", Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        buttonSend.isEnabled = false
-        buttonStop.isEnabled = true
+    private fun startAutomationTask(prompt: String) {
+        enableControls(false)
         textViewResponse.text = ""
         textViewStatus.text = "Starting automation..."
         
+        // Start the service first
+        startForegroundService()
+        
+        // Process the query
         geminiMcpService?.processUserQuery(prompt)
     }
 
-    private fun stopAutomation() {
+    private fun stopAutomationTask() {
         // Stop the service
-        if (serviceStarted) {
-            val stopIntent = Intent(this, GeminiMcpService::class.java).apply {
-                action = GeminiMcpService.ACTION_STOP_SERVICE
-            }
-            startService(stopIntent)
-        }
+        stopForegroundService()
         
-        buttonSend.isEnabled = true
-        buttonStop.isEnabled = false
-        textViewStatus.text = "Automation stopped"
-        updateServiceStatus("Stopped")
+        enableControls(true)
+        textViewStatus.text = "Task stopped by user"
+        textViewResponse.text = "Automation stopped"
     }
 
-    private fun updateServiceStatus(status: String) {
-        textViewServiceStatus.text = "Service: $status"
+    private fun enableControls(enabled: Boolean) {
+        buttonSend.isEnabled = enabled
+        buttonStop.isEnabled = !enabled
+        editTextPrompt.isEnabled = enabled
     }
 
-    private fun checkPermissions() {
-        val permissions = mutableListOf<String>()
-
-        // Check basic permissions
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.INTERNET) != PackageManager.PERMISSION_GRANTED) {
-            permissions.add(Manifest.permission.INTERNET)
-        }
-
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.WAKE_LOCK) != PackageManager.PERMISSION_GRANTED) {
-            permissions.add(Manifest.permission.WAKE_LOCK)
-        }
-
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_WIFI_STATE) != PackageManager.PERMISSION_GRANTED) {
-            permissions.add(Manifest.permission.ACCESS_WIFI_STATE)
-        }
-
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CHANGE_WIFI_STATE) != PackageManager.PERMISSION_GRANTED) {
-            permissions.add(Manifest.permission.CHANGE_WIFI_STATE)
-        }
-
-        // Check notification permission for Android 13+
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                permissions.add(Manifest.permission.POST_NOTIFICATIONS)
-            }
-        }
-
-        // Check foreground service permission for Android 14+
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.FOREGROUND_SERVICE) != PackageManager.PERMISSION_GRANTED) {
-                permissions.add(Manifest.permission.FOREGROUND_SERVICE)
-            }
-        }
-
-        if (permissions.isNotEmpty()) {
-            permissionLauncher.launch(permissions.toTypedArray())
-        } else {
-            checkOverlayPermission()
-        }
-    }
-
-    private fun checkOverlayPermission() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
-            showOverlayPermissionDialog()
-        } else {
-            initializeService()
-        }
-    }
-
-    private fun showOverlayPermissionDialog() {
-        AlertDialog.Builder(this)
-            .setTitle("Overlay Permission Required")
-            .setMessage("This app needs overlay permission to work in the background and interact with other apps. Please grant the permission in the next screen.")
-            .setPositiveButton("Grant Permission") { _, _ ->
-                requestOverlayPermission()
-            }
-            .setNegativeButton("Cancel") { _, _ ->
-                updateServiceStatus("Overlay permission denied")
-                Toast.makeText(this, "Overlay permission is required for automation", Toast.LENGTH_LONG).show()
-            }
-            .setCancelable(false)
-            .show()
-    }
-
-    private fun requestOverlayPermission() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            val intent = Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION).apply {
-                data = Uri.parse("package:$packageName")
-            }
-            overlayPermissionLauncher.launch(intent)
-        }
-    }
-
-    private fun showPermissionDeniedDialog() {
-        AlertDialog.Builder(this)
-            .setTitle("Permissions Required")
-            .setMessage("This app requires several permissions to function properly. Please grant all permissions in the app settings.")
-            .setPositiveButton("Settings") { _, _ ->
-                openAppSettings()
-            }
-            .setNegativeButton("Cancel") { _, _ ->
-                updateServiceStatus("Permissions denied")
-                finish()
-            }
-            .setCancelable(false)
-            .show()
-    }
-
-    private fun showOverlayPermissionDeniedDialog() {
-        AlertDialog.Builder(this)
-            .setTitle("Overlay Permission Denied")
-            .setMessage("Overlay permission is required for the app to work in the background. Please enable it in settings.")
-            .setPositiveButton("Settings") { _, _ ->
-                requestOverlayPermission()
-            }
-            .setNegativeButton("Continue Anyway") { _, _ ->
-                initializeService()
-            }
-            .show()
-    }
-
-    private fun openAppSettings() {
-        val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
-            data = Uri.fromParts("package", packageName, null)
-        }
-        startActivity(intent)
-    }
-
-    private fun initializeService() {
-        updateServiceStatus("Initializing...")
-        startAndBindService()
-    }
-
-    private fun startAndBindService() {
-        try {
-            // Start the service as a foreground service
+    private fun startForegroundService() {
+        if (!serviceStarted) {
             val serviceIntent = Intent(this, GeminiMcpService::class.java)
             
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -961,32 +846,205 @@ class MainActivity : AppCompatActivity() {
             }
             
             serviceStarted = true
-            
-            // Bind to the service
-            bindService(serviceIntent, connection, Context.BIND_AUTO_CREATE)
-            
-            updateServiceStatus("Starting...")
-            buttonSend.isEnabled = true
-            
-        } catch (e: Exception) {
-            updateServiceStatus("Failed to start service: ${e.message}")
-            Toast.makeText(this, "Failed to start service: ${e.message}", Toast.LENGTH_LONG).show()
+            updateServiceStatus()
         }
+        
+        // Bind to the service
+        val bindIntent = Intent(this, GeminiMcpService::class.java)
+        bindService(bindIntent, connection, Context.BIND_AUTO_CREATE)
+    }
+
+    private fun stopForegroundService() {
+        if (bound) {
+            geminiMcpService?.removeCallback()
+            unbindService(connection)
+            bound = false
+        }
+        
+        if (serviceStarted) {
+            val serviceIntent = Intent(this, GeminiMcpService::class.java)
+            stopService(serviceIntent)
+            serviceStarted = false
+        }
+        
+        updateServiceStatus()
+    }
+
+    private fun updateServiceStatus() {
+        runOnUiThread {
+            val statusText = when {
+                bound && serviceStarted -> "Service: Connected & Running"
+                serviceStarted -> "Service: Running (Not Connected)"
+                bound -> "Service: Connected (Not Running)"
+                else -> "Service: Stopped"
+            }
+            // You can add a service status TextView if needed
+        }
+    }
+
+    private fun checkAndRequestPermissions() {
+        val requiredPermissions = mutableListOf<String>()
+        
+        // Check basic permissions
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.INTERNET) != PackageManager.PERMISSION_GRANTED) {
+            requiredPermissions.add(Manifest.permission.INTERNET)
+        }
+        
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_NETWORK_STATE) != PackageManager.PERMISSION_GRANTED) {
+            requiredPermissions.add(Manifest.permission.ACCESS_NETWORK_STATE)
+        }
+        
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.WAKE_LOCK) != PackageManager.PERMISSION_GRANTED) {
+            requiredPermissions.add(Manifest.permission.WAKE_LOCK)
+        }
+        
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.FOREGROUND_SERVICE) != PackageManager.PERMISSION_GRANTED) {
+            requiredPermissions.add(Manifest.permission.FOREGROUND_SERVICE)
+        }
+
+        // Check notification permission for Android 13+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                requiredPermissions.add(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
+
+        if (requiredPermissions.isNotEmpty()) {
+            requestPermissionLauncher.launch(requiredPermissions.toTypedArray())
+        } else {
+            checkBatteryOptimization()
+        }
+    }
+
+    private fun checkAllPermissions(): Boolean {
+        val internetPermission = ContextCompat.checkSelfPermission(this, Manifest.permission.INTERNET) == PackageManager.PERMISSION_GRANTED
+        val networkPermission = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_NETWORK_STATE) == PackageManager.PERMISSION_GRANTED
+        val wakeLockPermission = ContextCompat.checkSelfPermission(this, Manifest.permission.WAKE_LOCK) == PackageManager.PERMISSION_GRANTED
+        val foregroundPermission = ContextCompat.checkSelfPermission(this, Manifest.permission.FOREGROUND_SERVICE) == PackageManager.PERMISSION_GRANTED
+        
+        var notificationPermission = true
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            notificationPermission = ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+        }
+        
+        val batteryOptimized = isBatteryOptimizationDisabled()
+        
+        return internetPermission && networkPermission && wakeLockPermission && foregroundPermission && notificationPermission && batteryOptimized
+    }
+
+    private fun checkBatteryOptimization() {
+        if (!isBatteryOptimizationDisabled()) {
+            showBatteryOptimizationDialog()
+        }
+        updatePermissionStatus()
+    }
+
+    private fun isBatteryOptimizationDisabled(): Boolean {
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        return powerManager.isIgnoringBatteryOptimizations(packageName)
+    }
+
+    private fun showBatteryOptimizationDialog() {
+        AlertDialog.Builder(this)
+            .setTitle("Battery Optimization")
+            .setMessage("To ensure the automation works reliably in the background, please disable battery optimization for this app.")
+            .setPositiveButton("Open Settings") { _, _ ->
+                openBatteryOptimizationSettings()
+            }
+            .setNegativeButton("Skip") { _, _ ->
+                updatePermissionStatus()
+            }
+            .show()
+    }
+
+    private fun openBatteryOptimizationSettings() {
+        try {
+            val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+            intent.data = Uri.parse("package:$packageName")
+            batteryOptimizationLauncher.launch(intent)
+        } catch (e: Exception) {
+            // Fallback to general battery optimization settings
+            try {
+                val intent = Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                batteryOptimizationLauncher.launch(intent)
+            } catch (ex: Exception) {
+                Toast.makeText(this, "Please manually disable battery optimization for this app", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    private fun showPermissionDialog() {
+        AlertDialog.Builder(this)
+            .setTitle("Permissions Required")
+            .setMessage("This app needs various permissions to work properly in the background. Please grant all permissions.")
+            .setPositiveButton("Grant") { _, _ ->
+                checkAndRequestPermissions()
+            }
+            .setNegativeButton("Cancel") { _, _ ->
+                updatePermissionStatus()
+            }
+            .show()
+    }
+
+    private fun showErrorDialog(title: String, message: String) {
+        AlertDialog.Builder(this)
+            .setTitle(title)
+            .setMessage(message)
+            .setPositiveButton("OK") { _, _ -> }
+            .show()
+    }
+
+    private fun updatePermissionStatus() {
+        val allPermissionsGranted = checkAllPermissions()
+        
+        val statusText = if (allPermissionsGranted) {
+            "✅ All permissions granted"
+        } else {
+            "⚠️ Permissions needed - Tap to grant"
+        }
+        
+        textViewPermissions.text = statusText
+        textViewPermissions.setTextColor(
+            if (allPermissionsGranted) {
+                ContextCompat.getColor(this, android.R.color.holo_green_dark)
+            } else {
+                ContextCompat.getColor(this, android.R.color.holo_orange_dark)
+            }
+        )
     }
 
     override fun onStart() {
         super.onStart()
-        // Service binding is handled in initializeService() after permissions are granted
+        updatePermissionStatus()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        updatePermissionStatus()
+        
+        // Reconnect to service if it's running
+        if (serviceStarted && !bound) {
+            val bindIntent = Intent(this, GeminiMcpService::class.java)
+            bindService(bindIntent, connection, Context.BIND_AUTO_CREATE)
+        }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        // Don't unbind here to keep service connected when app goes to background
     }
 
     override fun onStop() {
         super.onStop()
-        // Don't unbind when activity stops to maintain background operation
-        // Service will continue running in background
+        // Keep service running in background, just remove callback
+        if (bound) {
+            geminiMcpService?.removeCallback()
+        }
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        // Clean up service connection
         if (bound) {
             geminiMcpService?.removeCallback()
             unbindService(connection)
@@ -994,12 +1052,294 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    override fun onResume() {
-        super.onResume()
-        // Reconnect to service if it's running but we're not bound
-        if (serviceStarted && !bound) {
-            val serviceIntent = Intent(this, GeminiMcpService::class.java)
-            bindService(serviceIntent, connection, Context.BIND_AUTO_CREATE)
+    override fun onBackPressed() {
+        // Ask user if they want to continue automation in background
+        if (bound && !buttonSend.isEnabled) { // Task is running
+            AlertDialog.Builder(this)
+                .setTitle("Continue in Background?")
+                .setMessage("The automation is still running. Do you want to continue in the background or stop it?")
+                .setPositiveButton("Continue in Background") { _, _ ->
+                    // Move to background but keep service running
+                    moveTaskToBack(true)
+                }
+                .setNegativeButton("Stop Automation") { _, _ ->
+                    stopAutomationTask()
+                    super.onBackPressed()
+                }
+                .setNeutralButton("Cancel") { _, _ ->
+                    // Do nothing, stay in app
+                }
+                .show()
+        } else {
+            super.onBackPressed()
         }
     }
 }
+
+
+
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    
+    <!-- Network and Internet Permissions -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    
+    <!-- Service and Background Operation Permissions -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    
+    <!-- Battery and Power Management -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <uses-permission android:name="android.permission.DEVICE_POWER" 
+        tools:ignore="ProtectedPermissions" />
+    
+    <!-- Notification Permissions -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    
+    <!-- Boot and App Restart Permissions -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.QUICKBOOT_POWERON" 
+        tools:ignore="ProtectedPermissions" />
+    
+    <!-- System and Service Management -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.WRITE_SETTINGS" 
+        tools:ignore="ProtectedPermissions" />
+
+    <application
+        android:allowBackup="true"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/AppTheme"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:usesCleartextTraffic="true"
+        android:requestLegacyExternalStorage="true">
+        
+        <!-- Main Activity -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:theme="@style/AppTheme"
+            android:screenOrientation="portrait"
+            android:launchMode="singleTop">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        
+        <!-- Foreground Service -->
+        <service
+            android:name=".GeminiMcpService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="dataSync"
+            android:stopWithTask="false" />
+        
+        <!-- Boot Receiver for Auto-Start -->
+        <receiver
+            android:name=".BootReceiver"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.RECEIVE_BOOT_COMPLETED">
+            <intent-filter android:priority="1000">
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </receiver>
+        
+        <!-- App Restart Receiver -->
+        <receiver
+            android:name=".RestartReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                <action android:name="android.intent.action.PACKAGE_REPLACED" />
+                <data android:scheme="package" />
+            </intent-filter>
+        </receiver>
+        
+        <!-- Service Watchdog Job (Android 8.0+) -->
+        <service
+            android:name=".ServiceWatchdogJob"
+            android:permission="android.permission.BIND_JOB_SERVICE"
+            android:exported="false" />
+            
+    </application>
+</manifest>
+
+
+
+
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fillViewport="true"
+    tools:context=".MainActivity">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="16dp">
+
+        <!-- App Title -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Gemini MCP Automation"
+            android:textSize="24sp"
+            android:textStyle="bold"
+            android:gravity="center"
+            android:layout_marginBottom="16dp"
+            android:textColor="@android:color/black" />
+
+        <!-- Permissions Status -->
+        <TextView
+            android:id="@+id/textViewPermissions"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Checking permissions..."
+            android:textSize="14sp"
+            android:padding="12dp"
+            android:background="@android:drawable/editbox_background"
+            android:layout_marginBottom="16dp"
+            android:clickable="true"
+            android:focusable="true"
+            android:textColor="@android:color/holo_orange_dark" />
+
+        <!-- Query Input -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Enter your automation command:"
+            android:textSize="16sp"
+            android:textStyle="bold"
+            android:layout_marginBottom="8dp"
+            android:textColor="@android:color/black" />
+
+        <EditText
+            android:id="@+id/editTextPrompt"
+            android:layout_width="match_parent"
+            android:layout_height="120dp"
+            android:hint="e.g., 'Open YouTube and search for Android tutorials'"
+            android:minLines="4"
+            android:maxLines="6"
+            android:gravity="top|start"
+            android:background="@android:drawable/edit_text"
+            android:padding="12dp"
+            android:layout_marginBottom="16dp"
+            android:textSize="14sp"
+            android:inputType="textMultiLine|textCapSentences" />
+
+        <!-- Control Buttons -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginBottom="16dp">
+
+            <Button
+                android:id="@+id/buttonSend"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="Start Automation"
+                android:textSize="16sp"
+                android:layout_marginEnd="8dp"
+                android:backgroundTint="@android:color/holo_green_dark"
+                android:textColor="@android:color/white" />
+
+            <Button
+                android:id="@+id/buttonStop"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="Stop"
+                android:textSize="16sp"
+                android:layout_marginStart="8dp"
+                android:backgroundTint="@android:color/holo_red_dark"
+                android:textColor="@android:color/white"
+                android:enabled="false" />
+
+        </LinearLayout>
+
+        <!-- Status Section -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Status:"
+            android:textSize="16sp"
+            android:textStyle="bold"
+            android:layout_marginBottom="8dp"
+            android:textColor="@android:color/black" />
+
+        <TextView
+            android:id="@+id/textViewStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Ready"
+            android:textSize="14sp"
+            android:textStyle="italic"
+            android:layout_marginBottom="16dp"
+            android:padding="8dp"
+            android:background="@android:color/white"
+            android:textColor="@android:color/holo_blue_dark"
+            android:drawableStart="@android:drawable/ic_dialog_info"
+            android:drawablePadding="8dp" />
+
+        <!-- Response Section -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Response:"
+            android:textSize="16sp"
+            android:textStyle="bold"
+            android:layout_marginBottom="8dp"
+            android:textColor="@android:color/black" />
+
+        <ScrollView
+            android:layout_width="match_parent"
+            android:layout_height="200dp"
+            android:layout_marginBottom="16dp">
+
+            <TextView
+                android:id="@+id/textViewResponse"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text=""
+                android:textSize="12sp"
+                android:background="#f5f5f5"
+                android:padding="12dp"
+                android:fontFamily="monospace"
+                android:textColor="@android:color/black"
+                android:scrollbars="vertical" />
+
+        </ScrollView>
+
+        <!-- Instructions -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Instructions:\n• Grant all permissions for background operation\n• Disable battery optimization when prompted\n• The automation will continue even if you switch apps\n• Use the notification to return to this app"
+            android:textSize="12sp"
+            android:textColor="@android:color/darker_gray"
+            android:background="@android:color/white"
+            android:padding="12dp"
+            android:layout_marginTop="8dp" />
+
+    </LinearLayout>
+</ScrollView>
